@@ -71,7 +71,7 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     name, bal = found
-    await update.message.reply_text(f"Баланс {name}: {bal}")
+    await update.message.reply_text(f"Ваш баланс: {bal} джк")
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
