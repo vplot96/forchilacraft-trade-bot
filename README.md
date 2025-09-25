@@ -1,28 +1,30 @@
-# Forchilacraft Trade Bot — GID CSV Version
+# Forchilacraft Trade Bot — Username Mode
 
-Этот бот подключается к Google Sheets через CSV-экспорт (без Google Cloud API).  
-Сейчас реализована команда `/balance <имя>` для листа «Счета».  
-Код уже подготовлен к расширению для других листов (например, «Цены», «Операции»).
+Теперь команда `/balance` **не принимает аргументов**: бот определяет игрока по Telegram username отправителя и ищет его в колонке **Username** на листе «Счета».
 
-## Настройка Google Sheets
-1. Включи общий доступ к таблице: «По ссылке → Читатель».
-2. Найди в URL документа `SHEET_ID` (между `/d/` и `/edit`).
-3. Для листа «Счета» скопируй число после `#gid=` в URL — это `GID_ACCOUNTS`.
+## Требования к листу «Счета»
+Первая строка — заголовки. Должны быть как минимум:
+```
+Имя,Баланс,Username
+```
+Пример:
+```
+Имя,Баланс,Username
+Алиса,120,alice123
+Боб,75,bobka
+```
+> Username — без @ (т.е. `alice123`, не `@alice123`).
 
 ## Переменные окружения
-- `BOT_TOKEN` — токен из @BotFather.
-- `SHEET_ID` — ID документа Google Sheets.
-- `GID_ACCOUNTS` — gid листа «Счета».
-- (на будущее) `GID_PRICES`, `GID_OPS` — gid других листов.
+- `BOT_TOKEN` — токен из @BotFather
+- `SHEET_ID` — ID документа Google Sheets (между /d/ и /edit)
+- `GID_ACCOUNTS` — gid листа «Счета»
+- (на будущее) `GID_PRICES`, `GID_OPS` — gid других листов
+
+## Доступ к таблице
+Включи «По ссылке → Читатель» для документа (или публикацию).
 
 ## Проверка CSV вручную
-Собери URL и открой в браузере:
 ```
 https://docs.google.com/spreadsheets/d/SHEET_ID/export?format=csv&gid=GID
 ```
-
-## Запуск на Railway/Render
-1. Залей файлы в GitHub.
-2. Подключи репозиторий на Railway/Render.
-3. В Variables добавь `BOT_TOKEN`, `SHEET_ID`, `GID_ACCOUNTS`.
-4. Перезапусти сервис.

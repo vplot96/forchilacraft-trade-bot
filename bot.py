@@ -1,3 +1,4 @@
+
 import os, csv, io, requests
 from dotenv import load_dotenv
 from telegram import Update
@@ -35,40 +36,40 @@ def fetch_rows(gid: str):
 def normalize(s: str) -> str:
     return (s or "").strip().lower()
 
-def lookup_balance(player_name: str):
+def lookup_balance_by_username(username: str):
     rows = fetch_rows(GID_ACCOUNTS)
-    name_q = normalize(player_name)
-    exact = None
-    partial = None
+    u = normalize(username)
     for row in rows:
-        name = str(row.get("Имя", "")).strip()
-        bal = row.get("Баланс", "")
-        if normalize(name) == name_q:
-            exact = (name, bal)
-            break
-        if partial is None and name_q and name_q in normalize(name):
-            partial = (name, bal)
-    return exact or partial
+        cell = str(row.get("Username", "")).strip()
+        if normalize(cell) == u:
+            name = str(row.get("Имя", "")).strip()
+            bal = row.get("Баланс", "")
+            return name or username, bal
+    return None
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Команда: /balance <имя>. Пример: /balance Алиса")
+    await update.message.reply_text("Команда: /balance — показать ваш баланс по Telegram username.")
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Доступные команды: /start, /help, /balance <имя>")
+    await update.message.reply_text("Использование: /balance (без аргументов). Username должен быть в колонке 'Username' листа 'Счета'.")
 
 async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Укажите имя: /balance <имя>")
+    user = update.effective_user
+    username = user.username  # может быть None
+    if not username:
+        await update.message.reply_text("У вас не задан Telegram username (@...). Задайте его в настройках Telegram и обратитесь к администратору, чтобы он добавил вас в таблицу.")
         return
-    query_name = " ".join(context.args).strip()
+
     try:
-        found = lookup_balance(query_name)
+        found = lookup_balance_by_username(username)
     except Exception as e:
         await update.message.reply_text(f"Ошибка доступа к таблице: {e}")
         return
+
     if not found:
-        await update.message.reply_text(f"Игрок '{query_name}' не найден.")
+        await update.message.reply_text(f"Пользователь @{username} не найден в таблице. Обратитесь к администратору.")
         return
+
     name, bal = found
     await update.message.reply_text(f"Баланс {name}: {bal}")
 
