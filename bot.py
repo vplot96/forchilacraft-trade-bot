@@ -1,5 +1,5 @@
 
-import os, csv, io, requests, re
+import os, csv, io, requests, re, difflib
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -10,7 +10,7 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SHEET_ID = os.getenv("SHEET_ID")
 GID_ACCOUNTS = os.getenv("GID_ACCOUNTS")  # "Счета"
-GID_PRICES = os.getenv("GID_PRICES")      # "Товары" (required for /price)
+GID_PRICES = os.getenv("GID_PRICES")      # "Товары"
 
 # future placeholder
 GID_OPS = os.getenv("GID_OPS")
@@ -69,34 +69,46 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name, bal = found
     await update.message.reply_text(f"Ваш баланс: {bal} джк")
 
-# ---------- /price (by 'Название в игре' on "Товары") ----------
+# ---------- /price (fuzzy by 'Название товара' on "Товары") ----------
 
-def lookup_price_by_game_name(game_name: str):
+def lookup_price_by_product_name(query: str, cutoff: float = 0.45):
     if not GID_PRICES:
         raise RuntimeError("GID_PRICES is not set (лист 'Товары')")
     rows = fetch_rows(GID_PRICES)
-    q = normalize(game_name)
-    for row in rows:
-        name_in_game = str(row.get("Название в игре", "")).strip()
-        if normalize(name_in_game) == q:
-            display_name = str(row.get("Название товара", "")).strip() or name_in_game
-            price = row.get("Текущая цена", "")
-            return display_name, price
-    return None
+    q = normalize(query)
+    # Список нормализованных названий, и карта нормализованное -> оригинальная строка
+    names_norm = []
+    index_map = {}
+    for i, row in enumerate(rows):
+        title = str(row.get("Название товара", "")).strip()
+        n = normalize(title)
+        names_norm.append(n)
+        # если одинаковые нормализованные имена, пусть остаётся первое вхождение
+        if n not in index_map:
+            index_map[n] = i
+
+    best = difflib.get_close_matches(q, names_norm, n=1, cutoff=cutoff)
+    if not best:
+        return None
+    chosen_norm = best[0]
+    row = rows[index_map[chosen_norm]]
+    display_name = str(row.get("Название товара", "")).strip() or query
+    price = row.get("Текущая цена", "")
+    return display_name, price
 
 async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Использование: /price <название в игре>")
+        await update.message.reply_text("Использование: /price <название товара>")
         return
-    game_name = " ".join(context.args).strip()  # поддерживает пробелы
+    query = " ".join(context.args).strip()
     try:
-        found = lookup_price_by_game_name(game_name)
+        found = lookup_price_by_product_name(query)
     except Exception as e:
         await update.message.reply_text(f"Ошибка доступа к таблице: {e}")
         return
 
     if not found:
-        await update.message.reply_text(f"Товар '{game_name}' не найден.")
+        await update.message.reply_text(f"Товар, похожий на '{query}', не найден.")
         return
 
     display_name, price = found
@@ -105,10 +117,10 @@ async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- common ----------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Команды:\n/balance — ваш баланс по username\n/price <название в игре> — цена товара")
+    await update.message.reply_text("Команды:\n/balance — ваш баланс по username\n/price <название товара> — цена товара (нечёткий поиск)")
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Доступные команды: /start, /help, /balance, /price <название в игре>")
+    await update.message.reply_text("Доступные команды: /start, /help, /balance, /price <название товара>")
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
