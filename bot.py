@@ -90,7 +90,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Готов к работе! Введите /help для вывода списка команд.")
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Доступные команды:\n/balance – узнать свой баланс\n/price <название товара> – узнать текущий курс товара\n/pay <имя пользователя> <сумма> – сделать перевод")
+    await update.message.reply_text("Доступные команды:\n/balance – узнать свой баланс\n/price <название товара> – узнать текущий курс товара\n/pay <имя пользователя> <сумма> – сделать перевод\n/ops <число> – посмотреть последние операции")
 
 async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
