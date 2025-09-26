@@ -206,6 +206,90 @@ async def pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Не удалось отправить перевод. Попробуйте позже.")
 
+
+# ---------- /ops <число> — последние операции пользователя ----------
+from datetime import datetime
+
+def _fetch_ops_rows():
+    if not GID_OPS:
+        raise RuntimeError("GID_OPS is not set")
+    return fetch_rows(GID_OPS)
+
+def _parse_date_safe(s: str):
+    s = (s or "").strip()
+    for fmt in ("%d.%m.%y", "%d.%m.%Y"):
+        try:
+            return datetime.strptime(s, fmt)
+        except Exception:
+            continue
+    return None
+
+def _format_op_line(row):
+    title = str(row.get("Название", "")).strip()
+    op = str(row.get("Операция", "")).strip()
+    qty = str(row.get("Число", "")).strip()
+    amount = str(row.get("Сумма", "")).strip()
+    sign = "−" if op.lower().startswith("покуп") else "+"
+    return title, op, qty, amount, sign
+
+async def ops(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    limit = 5
+    if context.args:
+        arg = "".join(context.args).strip()
+        if arg.isdigit():
+            limit = max(1, min(50, int(arg)))
+
+    username = (update.effective_user.username or "").strip()
+    if not username:
+        await update.message.reply_text("У вас не задан Telegram username (@...).")
+        return
+
+    try:
+        accounts = _load_accounts_rows()
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка доступа к таблице: {e}")
+        return
+
+    me = _find_account(accounts, username)
+    if not me:
+        await update.message.reply_text(f"Пользователь @{username} не найден в таблице.")
+        return
+
+    player_name = str(me.get("Имя", "")).strip()
+    if not player_name:
+        await update.message.reply_text("В вашей записи не указано поле «Имя».")
+        return
+
+    try:
+        ops_rows = _fetch_ops_rows()
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка доступа к листу «Операции»: {e}")
+        return
+
+    mine = []
+    for r in ops_rows:
+        if str(r.get("Пользователь", "")).strip() == player_name:
+            dt = _parse_date_safe(r.get("Дата", ""))
+            if dt is None:
+                dt = datetime.min
+            mine.append((dt, r))
+
+    if not mine:
+        await update.message.reply_text("Для вас ещё нет операций.")
+        return
+
+    mine.sort(key=lambda x: x[0], reverse=True)
+    mine = mine[:limit]
+
+    lines = []
+    for dt, row in mine:
+        date_str = dt.strftime("%d.%m.%y") if dt != datetime.min else str(row.get("Дата", "")).strip()
+        title, op, qty, amount, sign = _format_op_line(row)
+        lines.append(f"{date_str} {op} \"{title}\" ({qty}): {sign}{amount} джк")
+
+    await update.message.reply_text("
+".join(lines))
+
 # Entrypoint
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
@@ -214,6 +298,7 @@ def main():
     app.add_handler(CommandHandler("balance", balance))
     app.add_handler(CommandHandler("price", price))
     app.add_handler(CommandHandler("pay", pay))
+    app.add_handler(CommandHandler("ops", ops))
     app.run_polling()
 
 if __name__ == "__main__":
