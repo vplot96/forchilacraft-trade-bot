@@ -96,12 +96,7 @@ def parse_balance(value: str) -> Decimal:
 
 def format_amount(d: Decimal) -> str:
     q = d.quantize(Decimal("0.01"))
-    if q == 0:
-        return "0"
-    s = format(q, "f")           # например "10.50"
-    if "." in s:
-        s = s.rstrip("0").rstrip(".")  # -> "10.5" или "10"
-    return s
+    return f"{q.normalize():f}".rstrip('0').rstrip('.') if q == q.to_integral() else f"{q:.2f}"
 
 # ---------- Google Form submit ----------
 def _form_action_url() -> str:
@@ -150,7 +145,7 @@ async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not row:
         await update.message.reply_text(f"Аккаунт {sender} не найден.")
         return
-    bal = parse_balance(row.get("Balance") or row.get("balance"))
+    bal = parse_balance(row.get("Баланс"))
     await update.message.reply_text(f"Баланс {sender}: {format_amount(bal)} джк")
 
 async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -250,7 +245,7 @@ async def cmd_pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Аккаунт {recipient} не найден.")
         return
 
-    sender_bal = parse_balance(sender_row.get("Balance") or sender_row.get("balance"))
+    sender_bal = parse_balance(sender_row.get("Баланс"))
     if sender_bal < amount:
         await update.message.reply_text(f"Недостаточно средств. Доступно: {format_amount(sender_bal)} джк.")
         return
@@ -272,7 +267,7 @@ async def cmd_pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
             users_after, _, _ = load_accounts_index()
             row_after = users_after.get(sender)
             if row_after:
-                new_sender_balance = parse_balance(row_after.get("Balance") or row_after.get("balance"))
+                new_sender_balance = parse_balance(row_after.get("Баланс"))
                 break
         except Exception:
             pass
