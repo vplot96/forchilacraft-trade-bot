@@ -1,47 +1,138 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+import os, csv, io, requests, re, difflib
+from dotenv import load_dotenv
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
+from decimal import Decimal, ROUND_HALF_UP  # (для /pay)
 
-import os
-import re
-import csv
-import logging
-from io import StringIO
-from decimal import Decimal, ROUND_HALF_UP
+# Load env
+load_dotenv()
 
-import requests
-from telegram.ext import Updater, CommandHandler
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+SHEET_ID = os.getenv("SHEET_ID")
+GID_ACCOUNTS = os.getenv("GID_ACCOUNTS")  # "Счета"
+GID_PRICES = os.getenv("GID_PRICES")      # "Товары"
 
-# -------------------- Logging --------------------
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
+# --- ПЕРЕМЕННЫЕ ДЛЯ /pay (из окружения Railway) ---
+FORM_ID = os.getenv("FORM_ID")
+ENTRY_USER = os.getenv("ENTRY_USER")
+ENTRY_SUM = os.getenv("ENTRY_SUM")
+FORM_POST_URL = f"https://docs.google.com/forms/d/e/{FORM_ID}/formResponse" if FORM_ID else None
 
-# -------------------- Config --------------------
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+# future placeholder
+GID_OPS = os.getenv("GID_OPS")
 
-SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
-SHEET_ACCOUNTS = os.getenv("SHEET_ACCOUNTS", "Счета")  # лист со столбцами: Username, Баланс
-COL_USERNAME = os.getenv("COL_USERNAME", "Username")
-COL_BALANCE = os.getenv("COL_BALANCE", "Баланс")
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is not set")
+if not SHEET_ID:
+    raise RuntimeError("SHEET_ID is not set")
+if not GID_ACCOUNTS:
+    raise RuntimeError("GID_ACCOUNTS is not set")
+# Проверим переменные формы, чтобы /pay мог работать предсказуемо
+if not FORM_ID or not ENTRY_USER or not ENTRY_SUM:
+    # Не падаем при запуске, но /pay вернёт понятную ошибку
+    pass
 
-# ---- Google Form (пуш транзакции) ----
-FORM_ID = os.getenv("FORM_ID", "1FAIpQLSegZNyaElRcoul_YMDZiZtp5ZLZlhBDiWf04UG-smUeAu6y9A")
-ENTRY_USER = os.getenv("ENTRY_USER", "entry.2015621373")
-ENTRY_SUM = os.getenv("ENTRY_SUM", "entry.40410086")
-FORM_POST_URL = f"https://docs.google.com/forms/d/e/{FORM_ID}/formResponse"
+def csv_url_for(gid: str) -> str:
+    return f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid={gid}"
 
-# -------------------- Helpers --------------------
-def parse_decimal_2(value) -> Decimal:
+def fetch_rows(gid: str):
+    url = csv_url_for(gid)
+    r = requests.get(url, timeout=10)
+    r.raise_for_status()
+    text = r.content.decode('utf-8-sig')
+    reader = csv.DictReader(io.StringIO(text))
+    return list(reader)
+
+def normalize(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip()).lower()
+
+# ---------- /balance (by Username on "Счета") ----------
+
+def lookup_balance_by_username(username: str):
+    rows = fetch_rows(GID_ACCOUNTS)
+    u = normalize(username)
+    for row in rows:
+        cell = str(row.get("Username", "")).strip()
+        if normalize(cell) == u:
+            name = str(row.get("Имя", "")).strip()
+            bal = row.get("Баланс", "")
+            return name or username, bal
+    return None
+
+async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    username = user.username  # может быть None
+    if not username:
+        await update.message.reply_text("У вас не задан Telegram username (@...). Задайте его в настройках Telegram и обратитесь к администратору, чтобы он добавил вас в таблицу.")
+        return
+
+    try:
+        found = lookup_balance_by_username(username)
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка доступа к таблице: {e}")
+        return
+
+    if not found:
+        await update.message.reply_text(f"Пользователь @{username} не найден в таблице. Обратитесь к администратору.")
+        return
+
+    name, bal = found
+    await update.message.reply_text(f"Ваш баланс: {bal} джк")
+
+# ---------- /price (fuzzy by 'Название товара' on "Товары") ----------
+
+def lookup_price_by_product_name(query: str, cutoff: float = 0.45):
+    if not GID_PRICES:
+        raise RuntimeError("GID_PRICES is not set (лист 'Товары')")
+    rows = fetch_rows(GID_PRICES)
+    q = normalize(query)
+    # Список нормализованных названий, и карта нормализованное -> оригинальная строка
+    names_norm = []
+    index_map = {}
+    for i, row in enumerate(rows):
+        title = str(row.get("Название товара", "")).strip()
+        n = normalize(title)
+        names_norm.append(n)
+        # если одинаковые нормализованные имена, пусть остаётся первое вхождение
+        if n not in index_map:
+            index_map[n] = i
+
+    best = difflib.get_close_matches(q, names_norm, n=1, cutoff=cutoff)
+    if not best:
+        return None
+    chosen_norm = best[0]
+    row = rows[index_map[chosen_norm]]
+    display_name = str(row.get("Название товара", "")).strip() or query
+    price = row.get("Текущая цена", "")
+    return display_name, price
+
+async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Использование: /price <название товара>")
+        return
+    query = " ".join(context.args).strip()
+    try:
+        found = lookup_price_by_product_name(query)
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка доступа к таблице: {e}")
+        return
+
+    if not found:
+        await update.message.reply_text(f"Товар, похожий на '{query}', не найден.")
+        return
+
+    display_name, price = found
+    await update.message.reply_text(f"{display_name} = {price} джк")
+
+# ---------- /pay (по Username на 'Счета' + пуш в Google Form) ----------
+
+def _parse_balance_to_decimal(value) -> Decimal:
     """
-    Универсальный парсер чисел из таблицы/ввода.
-    Поддержка '1234', '1234,56', '1234.56'. Округляет до 2 знаков HALF_UP.
+    Преобразует значение из колонки 'Баланс' в Decimal.
+    Поддерживает '1234', '1234,56', '1234.56'.
     """
-    if value is None:
-        return Decimal("0.00")
-    s = str(value).strip().replace(" ", "").replace(",", ".")
-    if s == "":
+    s = str(value or "").strip().replace(" ", "").replace(",", ".")
+    if not s:
         return Decimal("0.00")
     try:
         q = Decimal(s)
@@ -49,8 +140,7 @@ def parse_decimal_2(value) -> Decimal:
         return Decimal("0.00")
     return q.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
-
-def parse_amount_arg(raw: str) -> Decimal:
+def _parse_amount_arg(raw: str) -> Decimal:
     """
     Парсит сумму пользователя (разрешая ',' и '.'), оставляя ровно 2 знака.
     Бросает ValueError при неверном вводе.
@@ -61,158 +151,76 @@ def parse_amount_arg(raw: str) -> Decimal:
     q = Decimal(cleaned)
     return q.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
-
-def fmt_amount_comma2(amount: Decimal) -> str:
+def _fmt_amount_comma2(amount: Decimal) -> str:
     """Возвращает строку вида '12,34'."""
     return f"{amount:.2f}".replace(".", ",")
 
+def _load_accounts_rows():
+    return fetch_rows(GID_ACCOUNTS)
 
-def fetch_accounts_csv(spreadsheet_id: str, sheet_name: str):
-    """
-    Тянет лист как CSV через gviz без авторизации.
-    Требования: таблица должна быть доступна по ссылке (Anyone with the link / Viewer).
-    """
-    url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/gviz/tq?tqx=out:csv&sheet={quote_plus(sheet_name)}"
-    resp = requests.get(url, timeout=10)
-    resp.raise_for_status()
-    # Google отдает UTF-8
-    csv_text = resp.text
-    reader = csv.DictReader(StringIO(csv_text))
-    # Нормализуем заголовки: убираем BOM/пробелы
-    rows = []
-    for row in reader:
-        norm = {}
-        for k, v in row.items():
-            if k is None:
-                continue
-            nk = str(k).replace("\ufeff", "").strip()
-            norm[nk] = v
-        rows.append(norm)
-    return rows
-
-
-def read_accounts():
-    """Читает актуальные данные листа 'Счета' (без кеширования)."""
-    if not SPREADSHEET_ID:
-        raise RuntimeError("SPREADSHEET_ID не задан")
-    return fetch_accounts_csv(SPREADSHEET_ID, SHEET_ACCOUNTS)
-
-
-def find_account(rows, username: str):
-    """Ищет запись аккаунта по точному Username."""
-    if not username:
-        return None
-    u = str(username).strip()
+def _find_account(rows, username: str):
+    u = normalize(username)
     for r in rows:
-        if str(r.get(COL_USERNAME, "")).strip() == u:
+        if normalize(str(r.get("Username", ""))) == u:
             return r
     return None
 
-# -------------------- Bot commands --------------------
-def start(update, context):
-    update.message.reply_text(
-        "Привет! Доступные команды:\n"
-        "/balance — показать ваш баланс\n"
-        "/pay <username> <sum> — перевести средства"
-    )
-
-
-def balance(update, context):
-    """Показывает баланс текущего пользователя (по Telegram username)."""
-    msg = update.effective_message
-    username = update.effective_user.username
-    if not username:
-        msg.reply_text("У вас не задан Telegram username.")
+async def pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Проверка наличия переменных формы
+    if not FORM_ID or not ENTRY_USER or not ENTRY_SUM:
+        await update.message.reply_text("Не настроены параметры формы перевода. Обратитесь к администратору.")
         return
 
-    try:
-        rows = read_accounts()
-    except Exception as e:
-        logger.exception("Не удалось получить таблицу: %s", e)
-        msg.reply_text("Не удалось получить данные счетов. Повторите позже.")
+    # Аргументы
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text("Использование: /pay <username> <sum>")
         return
 
-    row = find_account(rows, username)
-    if not row:
-        msg.reply_text(f"Аккаунт {username} не найден.")
-        return
+    recipient = context.args[0].strip()
+    amount_raw = " ".join(context.args[1:]).strip()
 
-    bal = parse_decimal_2(row.get(COL_BALANCE))
-    msg.reply_text(f"Баланс {username}: {bal} джк")
-
-
-def pay(update, context):
-    """
-    /pay <username> <sum>
-    Проверяет наличие аккаунтов отправителя/получателя и достаточность средств.
-    Пушит транзакцию в Google Form (две цифры после запятой).
-
-    Сообщения:
-    - На балансе недостаточно средств.
-    - Ваш перевод подтверждён.
-    - Аккаунт <username> не найден.
-    """
-    msg = update.effective_message
-    args = context.args if hasattr(context, "args") else []
-
-    if len(args) < 2:
-        msg.reply_text("Использование: /pay <username> <sum>")
-        return
-
-    recipient = args[0].strip()
-    amount_raw = " ".join(args[1:]).strip()
-
-    # Telegram username отправителя
-    sender_username = update.effective_user.username
+    sender_username = (update.effective_user.username or "").strip()
     if not sender_username:
-        msg.reply_text("У вас не задан Telegram username.")
+        await update.message.reply_text("У вас не задан Telegram username.")
         return
 
-    # Валидация ника получателя
-    if not re.match(r"^[A-Za-z0-9_.\-]{1,32}$", recipient):
-        msg.reply_text("Некорректный <username>.")
-        return
-
-    # Парсим сумму с точностью до 2-х знаков
+    # Валидация суммы
     try:
-        amount = parse_amount_arg(amount_raw)
+        amount = _parse_amount_arg(amount_raw)
     except Exception:
-        msg.reply_text("Некорректная сумма. Пример: 10 или 12,50")
+        await update.message.reply_text("Некорректная сумма. Пример: 10 или 12,50")
         return
-
     if amount <= 0:
-        msg.reply_text("Сумма должна быть больше 0.")
+        await update.message.reply_text("Сумма должна быть больше 0.")
         return
 
-    # Читаем актуальные данные
+    # Читаем список аккаунтов
     try:
-        rows = read_accounts()
+        rows = _load_accounts_rows()
     except Exception as e:
-        logger.exception("Не удалось получить таблицу: %s", e)
-        msg.reply_text("Не удалось получить данные счетов. Повторите позже.")
+        await update.message.reply_text(f"Ошибка доступа к таблице: {e}")
         return
 
-    # Проверяем отправителя
-    sender_row = find_account(rows, sender_username)
+    sender_row = _find_account(rows, sender_username)
     if not sender_row:
-        msg.reply_text(f"Аккаунт {sender_username} не найден.")
+        await update.message.reply_text(f"Аккаунт {sender_username} не найден.")
         return
 
-    sender_balance = parse_decimal_2(sender_row.get(COL_BALANCE))
-    if sender_balance < amount:
-        msg.reply_text("На балансе недостаточно средств.")
-        return
-
-    # Проверяем получателя
-    recipient_row = find_account(rows, recipient)
+    recipient_row = _find_account(rows, recipient)
     if not recipient_row:
-        msg.reply_text(f"Аккаунт {recipient} не найден.")
+        await update.message.reply_text(f"Аккаунт {recipient} не найден.")
         return
 
-    # Отправляем данные в форму (ровно 2 знака, запятая как разделитель)
+    # Проверяем баланс
+    sender_balance = _parse_balance_to_decimal(sender_row.get("Баланс"))
+    if sender_balance < amount:
+        await update.message.reply_text("На балансе недостаточно средств.")
+        return
+
+    # Пуш в форму
     payload = {
         ENTRY_USER: recipient,
-        ENTRY_SUM: fmt_amount_comma2(amount),
+        ENTRY_SUM: _fmt_amount_comma2(amount),
     }
 
     try:
@@ -223,33 +231,30 @@ def pay(update, context):
             timeout=10,
         )
         ok = resp.status_code in (200, 302)
-    except requests.RequestException as e:
-        logger.exception("Ошибка отправки формы: %s", e)
+    except requests.RequestException:
         ok = False
 
     if ok:
-        msg.reply_text("Ваш перевод подтверждён.")
+        await update.message.reply_text("Ваш перевод подтверждён.")
     else:
-        msg.reply_text("Не удалось отправить перевод. Попробуйте позже.")
+        await update.message.reply_text("Не удалось отправить перевод. Попробуйте позже.")
 
+# ---------- common ----------
 
-# -------------------- Entrypoint --------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Команды:\n/balance — ваш баланс по username\n/price <название товара> — цена товара (нечёткий поиск)\n/pay <username> <sum> — перевод средств")
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Доступные команды: /start, /help, /balance, /price <название товара>, /pay <username> <sum>")
+
 def main():
-    if not TELEGRAM_TOKEN:
-        raise RuntimeError("TELEGRAM_TOKEN не задан")
-    if not SPREADSHEET_ID:
-        raise RuntimeError("SPREADSHEET_ID не задан")
-
-    updater = Updater(token=TELEGRAM_TOKEN, use_context=True)
-    dp = updater.dispatcher
-
-    dp.add_handler(CommandHandler("start", start))
-    dp.add_handler(CommandHandler("balance", balance))
-    dp.add_handler(CommandHandler("pay", pay))
-
-    updater.start_polling()
-    updater.idle()
-
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("balance", balance))
+    app.add_handler(CommandHandler("price", price))
+    app.add_handler(CommandHandler("pay", pay))  # <--- добавили обработчик /pay
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
