@@ -3,13 +3,12 @@
 
 import os
 import re
+import csv
 import logging
+from io import StringIO
 from decimal import Decimal, ROUND_HALF_UP
 
 import requests
-import gspread
-from google.oauth2.service_account import Credentials
-
 from telegram.ext import Updater, CommandHandler
 
 # -------------------- Logging --------------------
@@ -23,56 +22,21 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
-SHEET_ACCOUNTS = "Счета"             # Лист с аккаунтами
-COL_USERNAME = "Username"            # Точное имя заголовка
-COL_BALANCE = "Баланс"               # Точное имя заголовка
-
-# Google service-account creds: путь в GOOGLE_APPLICATION_CREDENTIALS
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets.readonly",
-    "https://www.googleapis.com/auth/drive.readonly",
-]
+SHEET_ACCOUNTS = os.getenv("SHEET_ACCOUNTS", "Счета")  # лист со столбцами: Username, Баланс
+COL_USERNAME = os.getenv("COL_USERNAME", "Username")
+COL_BALANCE = os.getenv("COL_BALANCE", "Баланс")
 
 # ---- Google Form (пуш транзакции) ----
-FORM_ID = "1FAIpQLSegZNyaElRcoul_YMDZiZtp5ZLZlhBDiWf04UG-smUeAu6y9A"
-ENTRY_USER = "entry.2015621373"
-ENTRY_SUM = "entry.40410086"
+FORM_ID = os.getenv("FORM_ID", "1FAIpQLSegZNyaElRcoul_YMDZiZtp5ZLZlhBDiWf04UG-smUeAu6y9A")
+ENTRY_USER = os.getenv("ENTRY_USER", "entry.2015621373")
+ENTRY_SUM = os.getenv("ENTRY_SUM", "entry.40410086")
 FORM_POST_URL = f"https://docs.google.com/forms/d/e/{FORM_ID}/formResponse"
 
-
-# -------------------- Google Sheets helpers (без кеша) --------------------
-def gs_client():
-    creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-    if not creds_path:
-        raise RuntimeError("GOOGLE_APPLICATION_CREDENTIALS не задан")
-    creds = Credentials.from_service_account_file(creds_path, scopes=SCOPES)
-    return gspread.authorize(creds)
-
-
-def read_accounts():
-    """Читает Актуальные данные листа 'Счета' (без кеширования)."""
-    gc = gs_client()
-    sh = gc.open_by_key(SPREADSHEET_ID)
-    ws = sh.worksheet(SHEET_ACCOUNTS)
-    # Возвращает список словарей по заголовкам
-    return ws.get_all_records()
-
-
-def find_account(rows, username: str):
-    """Ищет запись аккаунта по точному Username."""
-    if not username:
-        return None
-    u = str(username).strip()
-    for r in rows:
-        if str(r.get(COL_USERNAME, "")).strip() == u:
-            return r
-    return None
-
-
+# -------------------- Helpers --------------------
 def parse_decimal_2(value) -> Decimal:
     """
     Универсальный парсер чисел из таблицы/ввода.
-    Поддержка '1234', '1234,56', '1234.56'. Округляет до 2-х знаков HALF_UP.
+    Поддержка '1234', '1234,56', '1234.56'. Округляет до 2 знаков HALF_UP.
     """
     if value is None:
         return Decimal("0.00")
@@ -103,6 +67,47 @@ def fmt_amount_comma2(amount: Decimal) -> str:
     return f"{amount:.2f}".replace(".", ",")
 
 
+def fetch_accounts_csv(spreadsheet_id: str, sheet_name: str):
+    """
+    Тянет лист как CSV через gviz без авторизации.
+    Требования: таблица должна быть доступна по ссылке (Anyone with the link / Viewer).
+    """
+    url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/gviz/tq?tqx=out:csv&sheet={quote_plus(sheet_name)}"
+    resp = requests.get(url, timeout=10)
+    resp.raise_for_status()
+    # Google отдает UTF-8
+    csv_text = resp.text
+    reader = csv.DictReader(StringIO(csv_text))
+    # Нормализуем заголовки: убираем BOM/пробелы
+    rows = []
+    for row in reader:
+        norm = {}
+        for k, v in row.items():
+            if k is None:
+                continue
+            nk = str(k).replace("\ufeff", "").strip()
+            norm[nk] = v
+        rows.append(norm)
+    return rows
+
+
+def read_accounts():
+    """Читает актуальные данные листа 'Счета' (без кеширования)."""
+    if not SPREADSHEET_ID:
+        raise RuntimeError("SPREADSHEET_ID не задан")
+    return fetch_accounts_csv(SPREADSHEET_ID, SHEET_ACCOUNTS)
+
+
+def find_account(rows, username: str):
+    """Ищет запись аккаунта по точному Username."""
+    if not username:
+        return None
+    u = str(username).strip()
+    for r in rows:
+        if str(r.get(COL_USERNAME, "")).strip() == u:
+            return r
+    return None
+
 # -------------------- Bot commands --------------------
 def start(update, context):
     update.message.reply_text(
@@ -123,7 +128,7 @@ def balance(update, context):
     try:
         rows = read_accounts()
     except Exception as e:
-        logger.exception("Не удалось прочитать таблицу: %s", e)
+        logger.exception("Не удалось получить таблицу: %s", e)
         msg.reply_text("Не удалось получить данные счетов. Повторите позже.")
         return
 
@@ -133,7 +138,6 @@ def balance(update, context):
         return
 
     bal = parse_decimal_2(row.get(COL_BALANCE))
-    # Выводим так же, как раньше (джк), но без лишних форматов
     msg.reply_text(f"Баланс {username}: {bal} джк")
 
 
@@ -184,7 +188,7 @@ def pay(update, context):
     try:
         rows = read_accounts()
     except Exception as e:
-        logger.exception("Не удалось прочитать таблицу: %s", e)
+        logger.exception("Не удалось получить таблицу: %s", e)
         msg.reply_text("Не удалось получить данные счетов. Повторите позже.")
         return
 
@@ -233,6 +237,8 @@ def pay(update, context):
 def main():
     if not TELEGRAM_TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN не задан")
+    if not SPREADSHEET_ID:
+        raise RuntimeError("SPREADSHEET_ID не задан")
 
     updater = Updater(token=TELEGRAM_TOKEN, use_context=True)
     dp = updater.dispatcher
