@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 Forchilacraft Trade Bot — PTB v20+ compatible
-Changes vs previous:
-- Migrated from Updater/Dispatcher to Application (python-telegram-bot 20+)
-- Handlers are async
-- Keeps: CSV cache, username helper, /balance, /price, /pay via Google Form
+Notes in this version (no-cache):
+- Removed all CSV caching. Each read hits the Google Sheets CSV export directly.
+- Handlers remain async; compatible with python-telegram-bot 20+.
+- Features kept: username helper, /balance, /price, /pay via Google Form.
 """
 
 import os
@@ -37,30 +37,19 @@ logging.basicConfig(
 )
 log = logging.getLogger("forchilacraft-bot")
 
-# ---------- CSV cache ----------
-_CSV_CACHE = {}  # {gid: (ts, text)}
-_CSV_TTL_SEC = int(os.getenv("CSV_CACHE_TTL", "60"))
-
+# ---------- CSV helpers (no cache) ----------
 def _csv_url(gid: str) -> str:
     return f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid={gid}"
 
-def fetch_csv_cached(gid: str, timeout=8) -> str:
-    now = time.time()
-    cached = _CSV_CACHE.get(gid)
-    if cached and (now - cached[0] < _CSV_TTL_SEC):
-        return cached[1]
+def read_csv_as_rows(gid: str, timeout: int = 10):
+    """
+    Always fetch fresh CSV from Google Sheets and return a list of DictReader rows.
+    No caching.
+    """
     resp = requests.get(_csv_url(gid), timeout=timeout)
     resp.raise_for_status()
-    text = resp.text
-    _CSV_CACHE[gid] = (now, text)
-    return text
-
-def read_csv_as_rows(gid: str):
-    buf = io.StringIO(fetch_csv_cached(gid))
+    buf = io.StringIO(resp.text)
     return list(csv.DictReader(buf))
-
-def invalidate_csv_cache_for_gid(gid: str):
-    _CSV_CACHE.pop(gid, None)
 
 # ---------- Helpers ----------
 def normalize_username(u: str) -> str:
@@ -194,7 +183,7 @@ async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name_keys = ["Название товара", "название товара", "name", "название"]
     price_keys = ["Цена", "цена", "price"]
 
-    def get_col(row, keys):
+    def get_col_case_ins(row, keys):
         for k in keys:
             if k in row:
                 return row.get(k)
@@ -205,24 +194,24 @@ async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     exact = None
     for r in rows:
-        name = get_col(r, name_keys)
+        name = get_col_case_ins(r, name_keys)
         if name and name.strip().lower() == query:
             exact = r
             break
     if exact:
-        price = get_col(exact, price_keys)
-        await update.message.reply_text(f"{get_col(exact, name_keys)} = {price} джк")
+        price = get_col_case_ins(exact, price_keys)
+        await update.message.reply_text(f"{get_col_case_ins(exact, name_keys)} = {price} джк")
         return
 
     suggestions = []
     for r in rows:
-        name = get_col(r, name_keys)
+        name = get_col_case_ins(r, name_keys)
         if name and name.strip().lower().startswith(query):
             suggestions.append(r)
             if len(suggestions) >= 3:
                 break
     if suggestions:
-        lines = [f"{get_col(r, name_keys)} = {get_col(r, price_keys)} джк" for r in suggestions]
+        lines = [f"{get_col_case_ins(r, name_keys)} = {get_col_case_ins(r, price_keys)} джк" for r in suggestions]
         await update.message.reply_text("\n".join(lines))
         return
 
@@ -235,7 +224,7 @@ async def cmd_pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     - Recipient resolved by argument in the same column
     - Amount must be > 0 and <= sender balance
     - Writes via Google Form submit (FORM_ID, ENTRY_USER, ENTRY_SUM)
-    - After submit: invalidate cache and try to read refreshed balance with short retry
+    - After submit: read fresh balance with short retry (still no caching).
     """
     args = context.args or []
     if len(args) < 2:
@@ -286,8 +275,7 @@ async def cmd_pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Не удалось отправить запрос в Google Form. Попробуйте позже.")
         return
 
-    invalidate_csv_cache_for_gid(GID_ACCOUNTS)
-
+    # No cache to invalidate; just poll for an updated balance a few times.
     new_sender_balance = None
     for _ in range(6):  # ~5 seconds total
         try:
