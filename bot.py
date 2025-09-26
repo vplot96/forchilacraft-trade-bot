@@ -86,10 +86,10 @@ def _load_accounts_rows():
 
 # Commands
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Готов к работе! Введите команду /help для вывода списка команд.")
+    await update.message.reply_text("Готов к работе! Введите /help для вывода списка команд.")
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Доступные команды:\n/balance - Узнать свой баланс\n/price <название товара> - Узнать текущий курс товара\n/pay <имя пользователя> <сумма> - Сделать перевод пользователю")
+    await update.message.reply_text("Доступные команды:\n/balance - Узнать свой баланс\n/price <название товара> - Узнать текущий курс товара\n/pay <имя пользователя> <сумма> - Сделать перевод")
 
 async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -125,7 +125,7 @@ def lookup_price_by_product_name(query: str, cutoff: float = 0.45):
 
 async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Использование: /price <название товара>")
+        await update.message.reply_text("Использование: /price <название товара>\n\n<название товара> - название товара из игры. Может быть не точным.")
         return
     q = " ".join(context.args).strip()
     try:
@@ -144,7 +144,7 @@ async def pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Не настроены параметры формы перевода.")
         return
     if not context.args or len(context.args) < 2:
-        await update.message.reply_text("Использование: /pay <имя пользователя> <сумма>\n\n<имя пользователя> должен быть username участника из телеграм без @.")
+        await update.message.reply_text("Использование: /pay <имя пользователя> <сумма>\n\n<имя пользователя> - username пользователя из Телеграм без символа @.\n<сумма> - число, может быть с двумя знаками после запятой.")
         return
 
     recipient = context.args[0].strip()
