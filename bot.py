@@ -86,10 +86,10 @@ def _load_accounts_rows():
 
 # Commands
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Команды:\n/balance — ваш баланс\n/price <товар>\n/pay <username> <sum>")
+    await update.message.reply_text("Готов к работе! Введите команду /help для вывода списка команд.")
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Доступные команды: /start, /help, /balance, /price, /pay")
+    await update.message.reply_text("Доступные команды:\n/balance - Узнать свой баланс\n/price <название товара> - Узнать текущий курс товара\n/pay <имя пользователя> <сумма> - Сделать перевод пользователю")
 
 async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -144,7 +144,7 @@ async def pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Не настроены параметры формы перевода.")
         return
     if not context.args or len(context.args) < 2:
-        await update.message.reply_text("Использование: /pay <username> <sum>")
+        await update.message.reply_text("Использование: /pay <имя пользователя> <сумма>\n\n<имя пользователя> должен быть username участника из телеграм без @.")
         return
 
     recipient = context.args[0].strip()
