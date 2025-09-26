@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Forchilacraft Trade Bot — PTB v20+ compatible
-Notes in this version (no-cache):
-- Removed all CSV caching. Each read hits the Google Sheets CSV export directly.
-- Handlers remain async; compatible with python-telegram-bot 20+.
-- Features kept: username helper, /balance, /price, /pay via Google Form.
+Forchilacraft Trade Bot — PTB v20+ (no-cache, robust headers)
+Changes in this revision:
+- Still NO local caching — every read fetches fresh CSV from Google Sheets.
+- Robust column detection: insensitive to case, spaces, NBSP, dashes, underscores, and common Russian synonyms.
+- /price uses fuzzy match (substring) + a couple of aliases (e.g., "эндер жемчуг" → "жемчуг края").
 """
 
 import os
@@ -15,6 +15,7 @@ import decimal
 from decimal import Decimal
 import logging
 import requests
+import re
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -51,6 +52,52 @@ def read_csv_as_rows(gid: str, timeout: int = 10):
     buf = io.StringIO(resp.text)
     return list(csv.DictReader(buf))
 
+# ---------- Header normalization & picking ----------
+_WS = re.compile(r"[\s\u00A0\u2007\u202F_–—\-]+", re.UNICODE)  # spaces, NBSP, thin, underscores, dashes
+def _norm(s: str) -> str:
+    if s is None:
+        return ""
+    s = str(s)
+    s = s.replace("\u00A0", " ").replace("\u2007", " ").replace("\u202F", " ")  # NBSP variants
+    s = s.lower()
+    s = s.replace("ё", "е")  # treat ё == е
+    s = _WS.sub("", s)       # drop whitespace-like and separators
+    return s
+
+def _pick_header(actual_headers, synonyms):
+    """
+    Try to locate a header among actual_headers using a list of synonyms.
+    Returns the exact header string from the CSV if found, else None.
+    """
+    if not actual_headers:
+        return None
+    norm_map = { _norm(h): h for h in actual_headers }
+    # direct match by normalized equality
+    for syn in synonyms:
+        n = _norm(syn)
+        if n in norm_map:
+            return norm_map[n]
+    # fuzzy: substring either way
+    for h in actual_headers:
+        nh = _norm(h)
+        for syn in synonyms:
+            ns = _norm(syn)
+            if ns and (ns in nh or nh in ns):
+                return h
+    return None
+
+# Common synonyms
+USERNAME_SYNS = ["username", "ник", "аккаунт", "логин", "user", "telegram", "tg", "пользователь"]
+BALANCE_SYNS  = ["баланс", "balance", "счет", "счёт"]
+ITEM_SYNS     = ["название товара", "товар", "предмет", "название", "item", "наименование", "имя"]
+PRICE_SYNS    = ["цена", "стоимость", "price", "cost", "ценник"]
+
+# Known aliases for queries
+ALIASES = {
+    "эндержемчуг": "жемчугкрая",
+    "зловещаябутылочка": "зловещаябутылка",
+}
+
 # ---------- Helpers ----------
 def normalize_username(u: str) -> str:
     return (u or "").strip().lstrip("@").lower()
@@ -58,40 +105,6 @@ def normalize_username(u: str) -> str:
 def get_sender_username_from_tg(update: Update) -> str:
     u = update.effective_user.username if update and update.effective_user else None
     return normalize_username(u) if u else ""
-
-
-def get_col(row: dict, names: list[str]):
-    """
-    Возвращает значение из строки CSV по первому совпавшему названию колонки.
-    Сравнение без учёта регистра и с учётом лишних пробелов.
-    """
-    if not row:
-        return None
-    for want in names:
-        w = (want or "").strip().lower()
-        for k in row.keys():
-            if (k or "").strip().lower() == w:
-                return row.get(k)
-    return None
-
-def load_accounts_index():
-    """
-    Returns:
-      users_by_username: {username -> row_dict} (from 'Счета' sheet)
-      row_index: {username -> 1-based row_number}
-      header_index: {colname_lower -> 1-based col_number}
-    Expected cols at least: Username, Balance (case-insensitive).
-    """
-    rows = read_csv_as_rows(GID_ACCOUNTS)
-    users_by_username, row_index = {}, {}
-    header = rows[0].keys() if rows else []
-    header_index = {h.lower(): i+1 for i, h in enumerate(header)}
-    for i, r in enumerate(rows, start=2):  # header at row 1
-        u = normalize_username(r.get("Username") or r.get("username") or "")
-        if u:
-            users_by_username[u] = r
-            row_index[u] = i
-    return users_by_username, row_index, header_index
 
 def parse_balance(value: str) -> Decimal:
     if value is None:
@@ -147,6 +160,45 @@ def submit_to_google_form(username: str, amount: Decimal, timeout=8) -> bool:
         log.exception("Form submit error: %s", e)
         return False
 
+# ---------- Data access ----------
+def load_accounts_index():
+    """
+    Build indices from 'Счета' sheet using robust header picking.
+    Returns:
+      users_by_username: {username -> row_dict}
+      row_index: {username -> 1-based row_number}
+      cols: {"username": <header>, "balance": <header>}
+    """
+    rows = read_csv_as_rows(GID_ACCOUNTS)
+    header = list(rows[0].keys()) if rows else []
+    col_username = _pick_header(header, USERNAME_SYNS)
+    col_balance  = _pick_header(header, BALANCE_SYNS)
+
+    if not col_username:
+        raise RuntimeError("Не найдена колонка Username/Ник в листе 'Счета'.")
+    if not col_balance:
+        log.warning("Колонка Баланс не найдена по синонимам; все балансы будут 0.")
+    users_by_username, row_index = {}, {}
+    for i, r in enumerate(rows, start=2):  # header at 1
+        u = normalize_username(r.get(col_username, ""))
+        if u:
+            users_by_username[u] = r
+            row_index[u] = i
+    return users_by_username, row_index, {"username": col_username, "balance": col_balance}
+
+def load_prices_table():
+    """
+    Load 'Товары' (prices) with robust header picking.
+    Returns: (rows, {"name": name_col, "price": price_col})
+    """
+    rows = read_csv_as_rows(GID_PRICES)
+    header = list(rows[0].keys()) if rows else []
+    col_name  = _pick_header(header, ITEM_SYNS)
+    col_price = _pick_header(header, PRICE_SYNS)
+    if not col_name or not col_price:
+        log.warning("Не удалось надёжно определить колонки с названием и ценой на листе цен.")
+    return rows, {"name": col_name, "price": col_price}
+
 # ---------- Commands (async) ----------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Привет! Доступные команды: /balance, /price <товар>, /pay <кому> <сумма>")
@@ -156,62 +208,69 @@ async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not sender:
         await update.message.reply_text("У вас не задан username в Telegram. Задайте его в настройках профиля.")
         return
-    users, _, _ = load_accounts_index()
+    try:
+        users, _, cols = load_accounts_index()
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка чтения таблицы счетов: {e}")
+        return
     row = users.get(sender)
     if not row:
         await update.message.reply_text(f"Аккаунт {sender} не найден.")
         return
-    bal = parse_balance(get_col(row, ["Баланс", "Balance"]))
+    bal_col = cols.get("balance")
+    bal_val = row.get(bal_col) if bal_col else None
+    bal = parse_balance(bal_val)
     await update.message.reply_text(f"Баланс {sender}: {format_amount(bal)} джк")
 
 async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Simple price lookup by exact (case-insensitive) name,
-    then prefix match if no exact match.
-    Expected headers on 'Товары': 'Название товара' and 'Цена' (case-insensitive).
+    Fuzzy price lookup:
+      - exact (normalized) equality
+      - else: substring anywhere (shows up to 5 suggestions)
     """
     args = context.args or []
     if not args:
         await update.message.reply_text("Использование: /price <название товара>")
         return
-    query = " ".join(args).strip().lower()
-    if not query:
+    query_raw = " ".join(args).strip()
+    if not query_raw:
         await update.message.reply_text("Использование: /price <название товара>")
         return
 
-    rows = read_csv_as_rows(GID_PRICES)
-    name_keys = ["Название товара", "название товара", "name", "название"]
-    price_keys = ["Цена", "цена", "price"]
+    qn = _norm(query_raw)
+    if qn in ALIASES:
+        qn = ALIASES[qn]
 
-    def get_col_case_ins(row, keys):
-        for k in keys:
-            if k in row:
-                return row.get(k)
-            for kk in row.keys():
-                if kk.lower() == k.lower():
-                    return row.get(kk)
-        return None
-
-    exact = None
-    for r in rows:
-        name = get_col_case_ins(r, name_keys)
-        if name and name.strip().lower() == query:
-            exact = r
-            break
-    if exact:
-        price = get_col_case_ins(exact, price_keys)
-        await update.message.reply_text(f"{get_col_case_ins(exact, name_keys)} = {price} джк")
+    rows, cols = load_prices_table()
+    name_col, price_col = cols.get("name"), cols.get("price")
+    if not name_col or not price_col:
+        await update.message.reply_text("Не получилось определить колонки с товарами и ценами. Проверьте заголовки в таблице.")
         return
 
-    suggestions = []
+    # Build normalized name cache
+    norm_names = []
     for r in rows:
-        name = get_col_case_ins(r, name_keys)
-        if name and name.strip().lower().startswith(query):
-            suggestions.append(r)
-            if len(suggestions) >= 3:
+        name = str(r.get(name_col, "")).strip()
+        price = r.get(price_col, "")
+        norm_name = _norm(name)
+        norm_names.append((norm_name, name, price))
+
+    # Exact
+    for nn, name, price in norm_names:
+        if nn == qn:
+            await update.message.reply_text(f"{name} = {price} джк")
+            return
+
+    # Substring suggestions (anywhere)
+    sugest = []
+    for nn, name, price in norm_names:
+        if qn and qn in nn:
+            sugest.append((name, price))
+            if len(sugest) >= 5:
                 break
-    if suggestions:
-        lines = [f"{get_col_case_ins(r, name_keys)} = {get_col_case_ins(r, price_keys)} джк" for r in suggestions]
+
+    if sugest:
+        lines = [f"{n} = {p} джк" for n, p in sugest]
         await update.message.reply_text("\n".join(lines))
         return
 
@@ -251,7 +310,12 @@ async def cmd_pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     amount = amount.quantize(Decimal("0.01"), rounding=decimal.ROUND_HALF_UP)
 
-    users, _, _ = load_accounts_index()
+    try:
+        users, _, cols = load_accounts_index()
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка чтения таблицы счетов: {e}")
+        return
+
     sender_row = users.get(sender)
     if not sender_row:
         await update.message.reply_text(f"Аккаунт {sender} не найден.")
@@ -261,7 +325,8 @@ async def cmd_pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Аккаунт {recipient} не найден.")
         return
 
-    sender_bal = parse_balance(get_col(sender_row, ["Баланс", "Balance"]))
+    bal_col = cols.get("balance")
+    sender_bal = parse_balance(sender_row.get(bal_col) if bal_col else None)
     if sender_bal < amount:
         await update.message.reply_text(f"Недостаточно средств. Доступно: {format_amount(sender_bal)} джк.")
         return
@@ -277,16 +342,17 @@ async def cmd_pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # No cache to invalidate; just poll for an updated balance a few times.
     new_sender_balance = None
-    for _ in range(6):  # ~5 seconds total
+    for _ in range(7):  # ~6 seconds total
         try:
-            users_after, _, _ = load_accounts_index()
+            users_after, _, cols_after = load_accounts_index()
             row_after = users_after.get(sender)
             if row_after:
-                new_sender_balance = parse_balance(get_col(row_after, ["Баланс", "Balance"]))
+                bal_col2 = cols_after.get("balance")
+                new_sender_balance = parse_balance(row_after.get(bal_col2) if bal_col2 else None)
                 break
         except Exception:
             pass
-        time.sleep(0.8)
+        time.sleep(0.9)
 
     if new_sender_balance is None:
         await update.message.reply_text(
