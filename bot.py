@@ -96,7 +96,12 @@ def parse_balance(value: str) -> Decimal:
 
 def format_amount(d: Decimal) -> str:
     q = d.quantize(Decimal("0.01"))
-    return f"{q.normalize():f}".rstrip('0').rstrip('.') if q == q.to_integral() else f"{q:.2f}"
+    if q == 0:
+        return "0"
+    s = format(q, "f")           # например "10.50"
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")  # -> "10.5" или "10"
+    return s
 
 # ---------- Google Form submit ----------
 def _form_action_url() -> str:
