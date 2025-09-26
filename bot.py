@@ -89,7 +89,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Готов к работе! Введите /help для вывода списка команд.")
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Доступные команды:\n/balance - Узнать свой баланс\n/price <название товара> - Узнать текущий курс товара\n/pay <имя пользователя> <сумма> - Сделать перевод")
+    await update.message.reply_text("Доступные команды:\n/balance – узнать свой баланс\n/price <название товара> – узнать текущий курс товара\n/pay <имя пользователя> <сумма> – сделать перевод")
 
 async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -104,7 +104,7 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     acc = _find_account(rows, username)
     if not acc:
-        await update.message.reply_text(f"Пользователь @{username} не найден в таблице.")
+        await update.message.reply_text(f"Не могу найти аккаунт с именем @{username}.")
         return
     bal = _parse_balance_to_decimal(acc.get("Баланс"))
     await update.message.reply_text(f"Ваш баланс: {bal} джк")
@@ -125,7 +125,7 @@ def lookup_price_by_product_name(query: str, cutoff: float = 0.45):
 
 async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Использование: /price <название товара>\n\n<название товара> - название товара из игры. Может быть не точным.")
+        await update.message.reply_text("Использование: /price <название товара>\n\n<название товара> – название предмета из игры. Может быть не точным.")
         return
     q = " ".join(context.args).strip()
     try:
@@ -144,7 +144,7 @@ async def pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Не настроены параметры формы перевода.")
         return
     if not context.args or len(context.args) < 2:
-        await update.message.reply_text("Использование: /pay <имя пользователя> <сумма>\n\n<имя пользователя> - username пользователя из Телеграм без символа @.\n<сумма> - число, может быть с двумя знаками после запятой.")
+        await update.message.reply_text("Использование: /pay <имя пользователя> <сумма>\n\n<имя пользователя> – username пользователя из Телеграм без символа @.\n<сумма> – число, может быть с двумя знаками после запятой.")
         return
 
     recipient = context.args[0].strip()
@@ -159,7 +159,7 @@ async def pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         amount = _parse_amount_arg(amount_raw)
     except Exception:
-        await update.message.reply_text("Некорректная сумма. Пример: 10 или 12,50")
+        await update.message.reply_text("Не могу понять указанную сумму.")
         return
     if amount <= 0:
         await update.message.reply_text("Сумма должна быть больше 0.")
@@ -182,7 +182,7 @@ async def pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     sender_balance = _parse_balance_to_decimal(sender_row.get("Баланс"))
     if sender_balance < amount:
-        await update.message.reply_text("На балансе недостаточно средств.")
+        await update.message.reply_text("На вашем балансе недостаточно средств.")
         return
 
     payload = {
