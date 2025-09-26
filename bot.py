@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Forchilacraft Trade Bot — drop-in version with:
-- CSV cache for Google Sheets (TTL via CSV_CACHE_TTL, default 60s)
-- Unified username helper for /balance
-- New /pay command that submits transfers via Google Form
-  (uses FORM_ID, ENTRY_USER, ENTRY_SUM from environment)
-This file is written for python-telegram-bot v13.x (Updater/Dispatcher API).
+Forchilacraft Trade Bot — PTB v20+ compatible
+Changes vs previous:
+- Migrated from Updater/Dispatcher to Application (python-telegram-bot 20+)
+- Handlers are async
+- Keeps: CSV cache, username helper, /balance, /price, /pay via Google Form
 """
 
 import os
@@ -17,7 +16,8 @@ from decimal import Decimal
 import logging
 import requests
 
-from telegram.ext import Updater, CommandHandler
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ---------- Config from ENV ----------
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -66,7 +66,7 @@ def invalidate_csv_cache_for_gid(gid: str):
 def normalize_username(u: str) -> str:
     return (u or "").strip().lstrip("@").lower()
 
-def get_sender_username_from_tg(update) -> str:
+def get_sender_username_from_tg(update: Update) -> str:
     u = update.effective_user.username if update and update.effective_user else None
     return normalize_username(u) if u else ""
 
@@ -131,24 +131,24 @@ def submit_to_google_form(username: str, amount: Decimal, timeout=8) -> bool:
         log.exception("Form submit error: %s", e)
         return False
 
-# ---------- Commands ----------
-def cmd_start(update, context):
-    update.message.reply_text("Привет! Доступные команды: /balance, /price <товар>, /pay <кому> <сумма>")
+# ---------- Commands (async) ----------
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Привет! Доступные команды: /balance, /price <товар>, /pay <кому> <сумма>")
 
-def cmd_balance(update, context):
+async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sender = get_sender_username_from_tg(update)
     if not sender:
-        update.message.reply_text("У вас не задан username в Telegram. Задайте его в настройках профиля.")
+        await update.message.reply_text("У вас не задан username в Telegram. Задайте его в настройках профиля.")
         return
     users, _, _ = load_accounts_index()
     row = users.get(sender)
     if not row:
-        update.message.reply_text(f"Аккаунт {sender} не найден.")
+        await update.message.reply_text(f"Аккаунт {sender} не найден.")
         return
     bal = parse_balance(row.get("Balance") or row.get("balance"))
-    update.message.reply_text(f"Баланс {sender}: {format_amount(bal)} джк")
+    await update.message.reply_text(f"Баланс {sender}: {format_amount(bal)} джк")
 
-def cmd_price(update, context):
+async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Simple price lookup by exact (case-insensitive) name,
     then prefix match if no exact match.
@@ -156,11 +156,11 @@ def cmd_price(update, context):
     """
     args = context.args or []
     if not args:
-        update.message.reply_text("Использование: /price <название товара>")
+        await update.message.reply_text("Использование: /price <название товара>")
         return
     query = " ".join(args).strip().lower()
     if not query:
-        update.message.reply_text("Использование: /price <название товара>")
+        await update.message.reply_text("Использование: /price <название товара>")
         return
 
     rows = read_csv_as_rows(GID_PRICES)
@@ -171,13 +171,11 @@ def cmd_price(update, context):
         for k in keys:
             if k in row:
                 return row.get(k)
-            # try case-insensitive
             for kk in row.keys():
                 if kk.lower() == k.lower():
                     return row.get(kk)
         return None
 
-    # exact match first
     exact = None
     for r in rows:
         name = get_col(r, name_keys)
@@ -186,10 +184,9 @@ def cmd_price(update, context):
             break
     if exact:
         price = get_col(exact, price_keys)
-        update.message.reply_text(f"{get_col(exact, name_keys)} = {price} джк")
+        await update.message.reply_text(f"{get_col(exact, name_keys)} = {price} джк")
         return
 
-    # startswith suggestions
     suggestions = []
     for r in rows:
         name = get_col(r, name_keys)
@@ -199,12 +196,12 @@ def cmd_price(update, context):
                 break
     if suggestions:
         lines = [f"{get_col(r, name_keys)} = {get_col(r, price_keys)} джк" for r in suggestions]
-        update.message.reply_text("\n".join(lines))
+        await update.message.reply_text("\n".join(lines))
         return
 
-    update.message.reply_text("Товар не найден. Попробуйте точнее.")
+    await update.message.reply_text("Товар не найден. Попробуйте точнее.")
 
-def cmd_pay(update, context):
+async def cmd_pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /pay <recipient_username> <amount>
     - Sender inferred from Telegram username, must exist in 'Счета'.Username
@@ -215,7 +212,7 @@ def cmd_pay(update, context):
     """
     args = context.args or []
     if len(args) < 2:
-        update.message.reply_text("Использование: /pay <кому> <сумма>\nПример: /pay @alice 15 или /pay alice 15.5")
+        await update.message.reply_text("Использование: /pay <кому> <сумма>\nПример: /pay @alice 15 или /pay alice 15.5")
         return
 
     recipient_raw = args[0]
@@ -223,49 +220,45 @@ def cmd_pay(update, context):
 
     sender = get_sender_username_from_tg(update)
     if not sender:
-        update.message.reply_text("У вас не задан username в Telegram. Задайте его в настройках профиля.")
+        await update.message.reply_text("У вас не задан username в Telegram. Задайте его в настройках профиля.")
         return
 
     recipient = normalize_username(recipient_raw)
 
-    # parse amount
     try:
         amount = Decimal(amount_raw.replace(",", "."))
     except Exception:
-        update.message.reply_text("Некорректная сумма. Пример: 10 или 10,5")
+        await update.message.reply_text("Некорректная сумма. Пример: 10 или 10,5")
         return
     if amount <= 0:
-        update.message.reply_text("Сумма должна быть больше нуля.")
+        await update.message.reply_text("Сумма должна быть больше нуля.")
         return
     amount = amount.quantize(Decimal("0.01"), rounding=decimal.ROUND_HALF_UP)
 
-    # verify accounts
     users, _, _ = load_accounts_index()
     sender_row = users.get(sender)
     if not sender_row:
-        update.message.reply_text(f"Аккаунт {sender} не найден.")
+        await update.message.reply_text(f"Аккаунт {sender} не найден.")
         return
     recipient_row = users.get(recipient)
     if not recipient_row:
-        update.message.reply_text(f"Аккаунт {recipient} не найден.")
+        await update.message.reply_text(f"Аккаунт {recipient} не найден.")
         return
 
     sender_bal = parse_balance(sender_row.get("Balance") or sender_row.get("balance"))
     if sender_bal < amount:
-        update.message.reply_text(f"Недостаточно средств. Доступно: {format_amount(sender_bal)} джк.")
+        await update.message.reply_text(f"Недостаточно средств. Доступно: {format_amount(sender_bal)} джк.")
         return
 
-    # submit to Google Form
     if not FORM_ID or not ENTRY_USER or not ENTRY_SUM:
-        update.message.reply_text("Переводы пока не настроены (не заданы FORM_ID/ENTRY_USER/ENTRY_SUM).")
+        await update.message.reply_text("Переводы пока не настроены (не заданы FORM_ID/ENTRY_USER/ENTRY_SUM).")
         return
 
     ok = submit_to_google_form(recipient, amount)
     if not ok:
-        update.message.reply_text("Не удалось отправить запрос в Google Form. Попробуйте позже.")
+        await update.message.reply_text("Не удалось отправить запрос в Google Form. Попробуйте позже.")
         return
 
-    # Invalidate cache and try to read refreshed balance
     invalidate_csv_cache_for_gid(GID_ACCOUNTS)
 
     new_sender_balance = None
@@ -281,29 +274,27 @@ def cmd_pay(update, context):
         time.sleep(0.8)
 
     if new_sender_balance is None:
-        update.message.reply_text(
+        await update.message.reply_text(
             f"Перевод отправлен: {format_amount(amount)} джк → {recipient}.\n"
             "Обновление баланса появится в таблице через несколько секунд."
         )
     else:
-        update.message.reply_text(
+        await update.message.reply_text(
             f"Перевод выполнен: {format_amount(amount)} джк → {recipient}\n"
             f"Ваш новый баланс: {format_amount(new_sender_balance)} джк."
         )
 
 # ---------- Bootstrap ----------
 def main():
-    updater = Updater(BOT_TOKEN, use_context=True)
-    dp = updater.dispatcher
+    app = Application.builder().token(BOT_TOKEN).build()
 
-    dp.add_handler(CommandHandler("start", cmd_start))
-    dp.add_handler(CommandHandler("balance", cmd_balance))
-    dp.add_handler(CommandHandler("price", cmd_price))
-    dp.add_handler(CommandHandler("pay", cmd_pay))
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("balance", cmd_balance))
+    app.add_handler(CommandHandler("price", cmd_price))
+    app.add_handler(CommandHandler("pay", cmd_pay))
 
     log.info("Bot started. Commands: /start /balance /price /pay")
-    updater.start_polling()
-    updater.idle()
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
