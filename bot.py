@@ -292,8 +292,7 @@ async def ops(update: Update, context: ContextTypes.DEFAULT_TYPE):
         title, op, qty, amount, sign = _format_op_line(row)
         lines.append(f'{date_str} {op} "{title}" ({qty}): {sign}{amount} джк')
 
-    await update.message.reply_text("
-".join(lines))
+    await update.message.reply_text("\n".join(lines))
 
 # Entrypoint
 def main():
