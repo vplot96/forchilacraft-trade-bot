@@ -11,7 +11,7 @@ from datetime import datetime
 
 import requests
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 # Logging
 logging.basicConfig(
@@ -125,9 +125,15 @@ def lookup_price_by_product_name(query: str, cutoff: float = 0.45):
     return (str(row.get("Название товара","")).strip(), row.get("Текущая цена",""))
 
 async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # если нет аргументов — спрашиваем и ждём следующего сообщения автора
     if not context.args:
-        await update.message.reply_text("Использование: /price <название товара>\n\n<название товара> – название предмета из игры. Может быть не точным.")
+        user_id = update.effective_user.id
+        wait = context.chat_data.setdefault("price_wait", set())
+        wait.add(user_id)
+        await update.message.reply_text("Курс какого товара вы хотели бы узнать?")
         return
+
+    # обычный режим: /price <название товара>
     q = " ".join(context.args).strip()
     try:
         found = lookup_price_by_product_name(q)
@@ -294,6 +300,34 @@ async def ops(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("\n".join(lines))
 
+async def price_followup_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # реагируем только если пользователь в режиме ожидания
+    user_id = update.effective_user.id
+    wait = context.chat_data.get("price_wait", set())
+    if user_id not in wait:
+        return  # игнорируем чужие/несвязанные сообщения
+
+    query = (update.message.text or "").strip()
+    # снимаем ожидание сразу — одно сообщение = один ответ
+    wait.discard(user_id)
+
+    if not query:
+        await update.message.reply_text("Не понял название товара. Попробуйте ещё раз: /price")
+        return
+
+    try:
+        found = lookup_price_by_product_name(query)
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка доступа к таблице: {e}")
+        return
+
+    if not found:
+        await update.message.reply_text(f"Товар, похожий на '{query}', не найден.")
+        return
+
+    name, price_val = found
+    await update.message.reply_text(f"{name} = {price_val} джк")
+
 # Entrypoint
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
@@ -301,6 +335,7 @@ def main():
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("balance", balance))
     app.add_handler(CommandHandler("price", price))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, price_followup_listener))
     app.add_handler(CommandHandler("pay", pay))
     app.add_handler(CommandHandler("ops", ops))
     app.run_polling()
