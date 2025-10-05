@@ -11,7 +11,7 @@ from datetime import datetime
 
 import requests
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 # Logging
 logging.basicConfig(
@@ -133,18 +133,24 @@ async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Курс какого товара вы хотели бы узнать?")
         return
 
-    # обычный режим: /price <название товара>
-    q = " ".join(context.args).strip()
+    # Поддержка количества в конце строки
+    raw = " ".join(context.args).strip()
+    name_query, qty = _split_query_and_qty(raw)
+
     try:
-        found = lookup_price_by_product_name(q)
+        found = lookup_price_by_product_name(name_query)
     except Exception as e:
         await update.message.reply_text(f"Ошибка доступа к таблице: {e}")
         return
+
     if not found:
-        await update.message.reply_text(f"Товар, похожий на '{q}', не найден.")
+        await update.message.reply_text(f"Товар, похожий на '{name_query}', не найден.")
         return
-    name, price_val = found
-    await update.message.reply_text(f"{name} = {price_val} джк")
+
+    display_name, unit_price_str = found
+    unit = _money_to_decimal(unit_price_str)
+    total = unit * qty
+    await update.message.reply_text(f"{display_name} ({qty}) = { _fmt_total(total) } джк")
 
 async def pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not (FORM_ID and ENTRY_SENDER and ENTRY_RECIPIENT and ENTRY_SUM and FORM_POST_URL):
@@ -300,33 +306,49 @@ async def ops(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("\n".join(lines))
 
-async def price_followup_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # реагируем только если пользователь в режиме ожидания
-    user_id = update.effective_user.id
-    wait = context.chat_data.get("price_wait", set())
-    if user_id not in wait:
-        return  # игнорируем чужие/несвязанные сообщения
+# --- Поддержка количества в конце строки (для /price) ---
+def _split_query_and_qty(text: str):
+    """
+    Делит строку на (название товара, количество).
+    Примеры:
+      'алмаз' -> ('алмаз', 1)
+      'алмаз 10' -> ('алмаз', 10)
+    """
+    s = (text or "").strip()
+    m = re.search(r"\s+(\d+)$", s)
+    if m:
+        name = s[:m.start()].strip()
+        qty = int(m.group(1))
+        if qty <= 0:
+            qty = 1
+        return name, qty
+    return s, 1
 
-    query = (update.message.text or "").strip()
-    # снимаем ожидание сразу — одно сообщение = один ответ
-    wait.discard(user_id)
-
-    if not query:
-        await update.message.reply_text("Не понял название товара. Попробуйте ещё раз: /price")
-        return
-
+def _money_to_decimal(value) -> Decimal:
+    """
+    Переводит строку цены из таблицы в Decimal.
+    Поддерживает '1234', '1 234', '1234,56', '1234.56'.
+    """
+    s = str(value or "").strip().replace(" ", "").replace(",", ".")
+    if not s:
+        return Decimal("0")
     try:
-        found = lookup_price_by_product_name(query)
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка доступа к таблице: {e}")
-        return
+        q = Decimal(s)
+    except Exception:
+        q = Decimal("0")
+    return q
 
-    if not found:
-        await update.message.reply_text(f"Товар, похожий на '{query}', не найден.")
-        return
+def _fmt_total(amount: Decimal) -> str:
+    """
+    Красивый вывод общей суммы:
+    - без копеек, если целое;
+    - иначе 2 знака (с запятой).
+    """
+    amount = amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    if amount == amount.to_integral():
+        return f"{int(amount)}"
+    return f"{amount}".replace(".", ",")
 
-    name, price_val = found
-    await update.message.reply_text(f"{name} = {price_val} джк")
 
 # Entrypoint
 def main():
@@ -335,7 +357,6 @@ def main():
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("balance", balance))
     app.add_handler(CommandHandler("price", price))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, price_followup_listener))
     app.add_handler(CommandHandler("pay", pay))
     app.add_handler(CommandHandler("ops", ops))
     app.run_polling()
