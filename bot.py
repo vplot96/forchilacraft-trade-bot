@@ -11,7 +11,7 @@ from datetime import datetime
 
 import requests
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 # Logging
 logging.basicConfig(
@@ -350,6 +350,44 @@ def _fmt_total(amount: Decimal) -> str:
     return f"{amount}".replace(".", ",")
 
 
+async def price_followup_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # реагируем только если пользователь в режиме ожидания
+    user_id = update.effective_user.id
+    wait = context.chat_data.get("price_wait", set())
+    if user_id not in wait:
+        return  # не мы ждали этот ответ
+
+    query = (update.message.text or "").strip()
+    # одно сообщение = один ответ, снимаем ожидание
+    wait.discard(user_id)
+
+    if not query:
+        await update.message.reply_text("Не понял название товара. Попробуйте ещё раз: /price")
+        return
+
+    # поддержка количества в конце строки (например: 'алмаз 10')
+    name_query, qty = _split_query_and_qty(query)
+
+    try:
+        found = lookup_price_by_product_name(name_query)
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка доступа к таблице: {e}")
+        return
+
+    if not found:
+        await update.message.reply_text(f"Товар, похожий на '{name_query}', не найден.")
+        return
+
+    display_name, unit_price_str = found
+    unit = _money_to_decimal(unit_price_str)
+    total = unit * qty
+
+    # Условный вывод количества
+    if qty == 1:
+        await update.message.reply_text(f"{display_name} = { _fmt_total(total) } джк")
+    else:
+        await update.message.reply_text(f"{display_name} ({qty}) = { _fmt_total(total) } джк")
+
 # Entrypoint
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
@@ -357,6 +395,7 @@ def main():
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("balance", balance))
     app.add_handler(CommandHandler("price", price))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, price_followup_listener))
     app.add_handler(CommandHandler("pay", pay))
     app.add_handler(CommandHandler("ops", ops))
     app.run_polling()
