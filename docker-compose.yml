@@ -1,0 +1,17 @@
+version: "3.9"
+services:
+  bot:
+    build: .
+    container_name: forchilacraft-trade-bot
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN}
+      SHEET_ID: ${SHEET_ID}
+      GID_ACCOUNTS: ${GID_ACCOUNTS}
+      GID_PRICES: ${GID_PRICES}
+      GID_OPS: ${GID_OPS}
+      FORM_ID: ${FORM_ID}
+      ENTRY_SENDER: ${ENTRY_SENDER}
+      ENTRY_RECIPIENT: ${ENTRY_RECIPIENT}
+      ENTRY_SUM: ${ENTRY_SUM}
+      PYTHONUNBUFFERED: "1"
+    restart: unless-stopped
