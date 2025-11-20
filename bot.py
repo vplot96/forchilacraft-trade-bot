@@ -12,6 +12,11 @@ from datetime import datetime
 import requests
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from cmd_help import help_cmd
+from cmd_balance import balance, init_balance_helpers
+from cmd_price import price, price_followup_listener, init_price_helpers
+from cmd_pay import pay, init_pay_helpers
+from cmd_ops import ops, init_ops_helpers
 
 # Logging
 logging.basicConfig(
@@ -89,304 +94,26 @@ def _load_accounts_rows():
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Готов к работе! Введите /help для вывода списка команд.")
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Доступные команды:\n/balance – узнать свой баланс\n/price <название товара> – узнать текущий курс товара\n/pay <имя пользователя> <сумма> – сделать перевод\n/ops <число> – посмотреть последние операции")
-
-async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    username = user.username
-    if not username:
-        await update.message.reply_text("У вас не задан Telegram username (@...).")
-        return
-    try:
-        rows = _load_accounts_rows()
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка доступа к таблице: {e}")
-        return
-    acc = _find_account(rows, username)
-    if not acc:
-        await update.message.reply_text(f"Не могу найти аккаунт с именем @{username}.")
-        return
-    bal = _parse_balance_to_decimal(acc.get("Баланс"))
-    await update.message.reply_text(f"Ваш баланс: {bal} джк")
-
-def lookup_price_by_product_name(query: str, cutoff: float = 0.45):
-    if not GID_PRICES:
-        raise RuntimeError("GID_PRICES is not set")
-    rows = fetch_rows(GID_PRICES)
-    qn = normalize(query)
-    names = [normalize(str(r.get("Название товара",""))) for r in rows]
-    import difflib
-    best = difflib.get_close_matches(qn, names, n=1, cutoff=cutoff)
-    if not best:
-        return None
-    idx = names.index(best[0])
-    row = rows[idx]
-    return (str(row.get("Название товара","")).strip(), row.get("Текущая цена",""))
-
-async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # если нет аргументов — спрашиваем и ждём следующего сообщения автора
-    if not context.args:
-        user_id = update.effective_user.id
-        wait = context.chat_data.setdefault("price_wait", set())
-        wait.add(user_id)
-        await update.message.reply_text("Курс какого товара вы хотели бы узнать?")
-        return
-
-    # Поддержка количества в конце строки
-    raw = " ".join(context.args).strip()
-    name_query, qty = _split_query_and_qty(raw)
-
-    try:
-        found = lookup_price_by_product_name(name_query)
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка доступа к таблице: {e}")
-        return
-
-    if not found:
-        await update.message.reply_text(f"Товар, похожий на '{name_query}', не найден.")
-        return
-
-    display_name, unit_price_str = found
-    unit = _money_to_decimal(unit_price_str)
-    total = unit * qty
-    await update.message.reply_text(f"{display_name} ({qty}) = { _fmt_total(total) } джк")
-
-async def pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not (FORM_ID and ENTRY_SENDER and ENTRY_RECIPIENT and ENTRY_SUM and FORM_POST_URL):
-        await update.message.reply_text("Не настроены параметры формы перевода.")
-        return
-    if not context.args or len(context.args) < 2:
-        await update.message.reply_text("Использование: /pay <имя пользователя> <сумма>\n\n<имя пользователя> – username пользователя из Телеграм без символа @.\n<сумма> – число, может быть с двумя знаками после запятой.")
-        return
-
-    recipient = context.args[0].strip()
-    amount_raw = " ".join(context.args[1:]).strip()
-    sender_username = (update.effective_user.username or "").strip()
-    if not sender_username:
-        await update.message.reply_text("У вас не задан Telegram username.")
-        return
-    if normalize(sender_username) == normalize(recipient):
-        await update.message.reply_text("Нельзя осуществить перевод себе.")
-        return
-    try:
-        amount = _parse_amount_arg(amount_raw)
-    except Exception:
-        await update.message.reply_text("Не могу понять указанную сумму.")
-        return
-    if amount <= 0:
-        await update.message.reply_text("Сумма должна быть больше 0.")
-        return
-
-    try:
-        rows = _load_accounts_rows()
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка доступа к таблице: {e}")
-        return
-
-    sender_row = _find_account(rows, sender_username)
-    if not sender_row:
-        await update.message.reply_text(f"Аккаунт {sender_username} не найден.")
-        return
-    recipient_row = _find_account(rows, recipient)
-    if not recipient_row:
-        await update.message.reply_text(f"Аккаунт {recipient} не найден.")
-        return
-
-    sender_balance = _parse_balance_to_decimal(sender_row.get("Баланс"))
-    if sender_balance < amount:
-        await update.message.reply_text("На вашем балансе недостаточно средств.")
-        return
-
-    payload = {
-        ENTRY_SENDER: sender_username,
-        ENTRY_RECIPIENT: recipient,
-        ENTRY_SUM: _fmt_amount_comma2(amount),
-    }
-    try:
-        resp = requests.post(
-            FORM_POST_URL,
-            data=payload,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; ForchilacraftBot/1.0)"},
-            timeout=10,
-        )
-        ok = resp.status_code in (200, 302)
-    except requests.RequestException:
-        ok = False
-
-    if ok:
-        await update.message.reply_text("Ваш перевод подтверждён.")
-    else:
-        await update.message.reply_text("Не удалось отправить перевод. Попробуйте позже.")
 
 
-# ---------- /ops <число> — последние операции пользователя ----------
-def _fetch_ops_rows():
-    if not GID_OPS:
-        raise RuntimeError("GID_OPS is not set")
-    return fetch_rows(GID_OPS)
-
-def _parse_date_safe(s: str):
-    s = (s or "").strip()
-    for fmt in ("%d.%m.%y", "%d.%m.%Y"):
-        try:
-            return datetime.strptime(s, fmt)
-        except Exception:
-            continue
-    return None
-
-def _format_op_line(row):
-    # Ожидаемые колонки: Название, Операция, Число, Сумма, Пользователь, Дата
-    title = str(row.get("Название", "")).strip()
-    op = str(row.get("Операция", "")).strip()  # "Покупка" / "Продажа"
-    qty = str(row.get("Число", "")).strip()
-    amount = str(row.get("Сумма", "")).strip()
-    sign = "−" if op.lower().startswith("покуп") else "+"  # минус для Покупка, плюс для Продажа
-    return title, op, qty, amount, sign
-
-async def ops(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Сколько выводить (по умолчанию 5)
-    limit = 5
-    if context.args:
-        arg = "".join(context.args).strip()
-        if arg.isdigit():
-            limit = max(1, min(50, int(arg)))  # ограничим до 50
-
-    # Определяем отправителя и его Имя
-    username = (update.effective_user.username or "").strip()
-    if not username:
-        await update.message.reply_text("У вас не задан Telegram username (@...).")
-        return
-
-    try:
-        accounts = _load_accounts_rows()
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка доступа к таблице: {e}")
-        return
-
-    me = _find_account(accounts, username)
-    if not me:
-        await update.message.reply_text(f"Не могу найти аккаунт с именем @{username}.")
-        return
-
-    player_name = str(me.get("Имя", "")).strip()
-    if not player_name:
-        await update.message.reply_text("В вашей записи не указано поле «Имя». Обратитесь к администратору.")
-        return
-
-    # Грузим операции и фильтруем по имени
-    try:
-        ops_rows = _fetch_ops_rows()
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка доступа к листу «Операции»: {e}")
-        return
-
-    mine = []
-    for r in ops_rows:
-        if str(r.get("Пользователь", "")).strip() == player_name:
-            dt = _parse_date_safe(r.get("Дата", ""))
-            if dt is None:
-                dt = datetime.min
-            mine.append((dt, r))
-
-    if not mine:
-        await update.message.reply_text("Для вас ещё нет операций.")
-        return
-
-    # Сортируем по дате по убыванию и берём limit
-    mine.sort(key=lambda x: x[0], reverse=True)
-    mine = mine[:limit]
-
-    # Формируем строки
-    lines = []
-    for dt, row in mine:
-        date_str = dt.strftime("%d.%m.%y") if dt != datetime.min else str(row.get("Дата", "")).strip()
-        title, op, qty, amount, sign = _format_op_line(row)
-        lines.append(f'{date_str} {op} "{title}" ({qty}): {sign}{amount} джк')
-
-    await update.message.reply_text("\n".join(lines))
-
-# --- Поддержка количества в конце строки (для /price) ---
-def _split_query_and_qty(text: str):
-    """
-    Делит строку на (название товара, количество).
-    Примеры:
-      'алмаз' -> ('алмаз', 1)
-      'алмаз 10' -> ('алмаз', 10)
-    """
-    s = (text or "").strip()
-    m = re.search(r"\s+(\d+)$", s)
-    if m:
-        name = s[:m.start()].strip()
-        qty = int(m.group(1))
-        if qty <= 0:
-            qty = 1
-        return name, qty
-    return s, 1
-
-def _money_to_decimal(value) -> Decimal:
-    """
-    Переводит строку цены из таблицы в Decimal.
-    Поддерживает '1234', '1 234', '1234,56', '1234.56'.
-    """
-    s = str(value or "").strip().replace(" ", "").replace(",", ".")
-    if not s:
-        return Decimal("0")
-    try:
-        q = Decimal(s)
-    except Exception:
-        q = Decimal("0")
-    return q
-
-def _fmt_total(amount: Decimal) -> str:
-    """
-    Красивый вывод общей суммы:
-    - без копеек, если целое;
-    - иначе 2 знака (с запятой).
-    """
-    amount = amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    if amount == amount.to_integral():
-        return f"{int(amount)}"
-    return f"{amount}".replace(".", ",")
 
 
-async def price_followup_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # реагируем только если пользователь в режиме ожидания
-    user_id = update.effective_user.id
-    wait = context.chat_data.get("price_wait", set())
-    if user_id not in wait:
-        return  # не мы ждали этот ответ
 
-    query = (update.message.text or "").strip()
-    # одно сообщение = один ответ, снимаем ожидание
-    wait.discard(user_id)
 
-    if not query:
-        await update.message.reply_text("Не понял название товара. Попробуйте ещё раз: /price")
-        return
 
-    # поддержка количества в конце строки (например: 'алмаз 10')
-    name_query, qty = _split_query_and_qty(query)
 
-    try:
-        found = lookup_price_by_product_name(name_query)
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка доступа к таблице: {e}")
-        return
 
-    if not found:
-        await update.message.reply_text(f"Товар, похожий на '{name_query}', не найден.")
-        return
 
-    display_name, unit_price_str = found
-    unit = _money_to_decimal(unit_price_str)
-    total = unit * qty
 
-    # Условный вывод количества
-    if qty == 1:
-        await update.message.reply_text(f"{display_name} = { _fmt_total(total) } джк")
-    else:
-        await update.message.reply_text(f"{display_name} ({qty}) = { _fmt_total(total) } джк")
+
+
+# Инициализация хелперов для команд
+init_balance_helpers(_load_accounts_rows, _find_account, _parse_balance_to_decimal)
+init_price_helpers(lookup_price_by_product_name, _split_query_and_qty, _money_to_decimal, _fmt_total)
+init_pay_helpers(FORM_ID, ENTRY_SENDER, ENTRY_RECIPIENT, ENTRY_SUM, FORM_POST_URL,
+                 normalize, _parse_amount_arg, _load_accounts_rows, _find_account,
+                 _parse_balance_to_decimal, _fmt_amount_comma2)
+init_ops_helpers(_load_accounts_rows, _find_account, _fetch_ops_rows, _parse_date_safe, _format_op_line)
 
 # Entrypoint
 def main():
