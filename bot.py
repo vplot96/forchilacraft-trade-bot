@@ -61,41 +61,16 @@ def optional_env(name: str) -> str | None:
 # Core env (обязательные)
 # -----------------------------
 BOT_TOKEN = require_env("BOT_TOKEN")
-
 SHEET_ID = require_env("SHEET_ID")
 GID_ACCOUNTS = require_env("GID_ACCOUNTS")
-GID_PRICES = require_env("GID_PRICES")
-GID_OPS = require_env("GID_OPS")
+
+# Эти листы нужны не всегда — команды будут подключаться только если они заданы
+GID_PRICES = optional_env("GID_PRICES")
+GID_OPS = optional_env("GID_OPS")
 
 
 # -----------------------------
-# Google Forms env (явно, без "фабрики")
-# -----------------------------
-# 1) Переводы (/pay)
-FORM_PAY_ID = require_env("FORM_PAY_ID")
-FORM_PAY_ENTRY_SENDER = require_env("FORM_PAY_ENTRY_SENDER")           # entry.XXXX
-FORM_PAY_ENTRY_RECIPIENT = require_env("FORM_PAY_ENTRY_RECIPIENT")     # entry.XXXX
-FORM_PAY_ENTRY_SUM = require_env("FORM_PAY_ENTRY_SUM")                 # entry.XXXX
-FORM_PAY_POST_URL = f"https://docs.google.com/forms/d/e/{FORM_PAY_ID}/formResponse"
-
-# 2) Операции (покупка/продажа) — на будущее
-FORM_OPS_ID = optional_env("FORM_OPS_ID")
-FORM_OPS_POST_URL = f"https://docs.google.com/forms/d/e/{FORM_OPS_ID}/formResponse" if FORM_OPS_ID else None
-FORM_OPS_ENTRY_USER = optional_env("FORM_OPS_ENTRY_USER")
-FORM_OPS_ENTRY_ACTION = optional_env("FORM_OPS_ENTRY_ACTION")
-FORM_OPS_ENTRY_ITEM = optional_env("FORM_OPS_ENTRY_ITEM")
-FORM_OPS_ENTRY_QTY = optional_env("FORM_OPS_ENTRY_QTY")
-FORM_OPS_ENTRY_SUM = optional_env("FORM_OPS_ENTRY_SUM")
-
-# 3) Изменение цен — на будущее
-FORM_PRICE_ID = optional_env("FORM_PRICE_ID")
-FORM_PRICE_POST_URL = f"https://docs.google.com/forms/d/e/{FORM_PRICE_ID}/formResponse" if FORM_PRICE_ID else None
-FORM_PRICE_ENTRY_ITEM = optional_env("FORM_PRICE_ENTRY_ITEM")
-FORM_PRICE_ENTRY_NEW_PRICE = optional_env("FORM_PRICE_ENTRY_NEW_PRICE")
-
-
-# -----------------------------
-# Общие хелперы
+# Общие хелперы (таблица/форматирование)
 # -----------------------------
 def normalize(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip()).lower()
@@ -107,7 +82,7 @@ def csv_url_for(gid: str) -> str:
 
 def fetch_rows(gid: str):
     url = csv_url_for(gid)
-    r = requests.get(url, timeout=15)
+    r = requests.get(url, timeout=20)
     r.raise_for_status()
     text = r.content.decode("utf-8-sig")
     reader = csv.DictReader(StringIO(text))
@@ -165,7 +140,7 @@ def _load_accounts_rows():
 
 
 # -----------------------------
-# Хелперы для /price
+# /price helpers
 # -----------------------------
 def _split_query_and_qty(text: str):
     # "алмаз" -> ("алмаз", None) ; "алмаз 10" -> ("алмаз", 10)
@@ -195,6 +170,9 @@ def _fmt_total(product_name: str, unit_price: Decimal, qty: int | None) -> str:
 
 
 def lookup_price_by_product_name(query: str):
+    if not GID_PRICES:
+        return None
+
     q = normalize(query)
     if not q:
         return None
@@ -211,9 +189,7 @@ def lookup_price_by_product_name(query: str):
             if v:
                 name_val = v
                 break
-        if not name_val:
-            continue
-        if normalize(name_val) != q:
+        if not name_val or normalize(name_val) != q:
             continue
 
         price_val = None
@@ -231,9 +207,11 @@ def lookup_price_by_product_name(query: str):
 
 
 # -----------------------------
-# Хелперы для /ops
+# /ops helpers
 # -----------------------------
 def _fetch_ops_rows():
+    if not GID_OPS:
+        return []
     return fetch_rows(GID_OPS)
 
 
@@ -276,37 +254,47 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # -----------------------------
 # Инициализация хелперов для команд
+# (пока оставляем, чтобы не ломать существующие команды;
+#  дальше мы сможем переносить логику внутрь самих команд)
 # -----------------------------
 init_balance_helpers(_load_accounts_rows, _find_account, _parse_balance_to_decimal)
 
-init_price_helpers(
-    lookup_price_by_product_name,
-    _split_query_and_qty,
-    _money_to_decimal,
-    _fmt_total,
-)
+# price и ops подключаем только если заданы нужные GID
+if GID_PRICES:
+    init_price_helpers(lookup_price_by_product_name, _split_query_and_qty, _money_to_decimal, _fmt_total)
+else:
+    logger.warning("GID_PRICES is not set: /price будет недоступна.")
 
-init_pay_helpers(
-    FORM_PAY_ID,
-    FORM_PAY_ENTRY_SENDER,
-    FORM_PAY_ENTRY_RECIPIENT,
-    FORM_PAY_ENTRY_SUM,
-    FORM_PAY_POST_URL,
-    normalize,
-    _parse_amount_arg,
-    _load_accounts_rows,
-    _find_account,
-    _parse_balance_to_decimal,
-    _fmt_amount_comma2,
-)
+if GID_OPS:
+    init_ops_helpers(_load_accounts_rows, _find_account, _fetch_ops_rows, _parse_date_safe, _format_op_line)
+else:
+    logger.warning("GID_OPS is not set: /ops будет недоступна.")
 
-init_ops_helpers(
-    _load_accounts_rows,
-    _find_account,
-    _fetch_ops_rows,
-    _parse_date_safe,
-    _format_op_line,
-)
+
+# pay-конфиг читаем явно, но делаем опциональным — чтобы bot.py не падал, пока ты перекладываешь pay внутрь команды
+FORM_PAY_ID = optional_env("FORM_PAY_ID")
+FORM_PAY_ENTRY_SENDER = optional_env("FORM_PAY_ENTRY_SENDER")
+FORM_PAY_ENTRY_RECIPIENT = optional_env("FORM_PAY_ENTRY_RECIPIENT")
+FORM_PAY_ENTRY_SUM = optional_env("FORM_PAY_ENTRY_SUM")
+FORM_PAY_POST_URL = f"https://docs.google.com/forms/d/e/{FORM_PAY_ID}/formResponse" if FORM_PAY_ID else None
+
+_pay_ready = all([FORM_PAY_ID, FORM_PAY_ENTRY_SENDER, FORM_PAY_ENTRY_RECIPIENT, FORM_PAY_ENTRY_SUM, FORM_PAY_POST_URL])
+if _pay_ready:
+    init_pay_helpers(
+        FORM_PAY_ID,
+        FORM_PAY_ENTRY_SENDER,
+        FORM_PAY_ENTRY_RECIPIENT,
+        FORM_PAY_ENTRY_SUM,
+        FORM_PAY_POST_URL,
+        normalize,
+        _parse_amount_arg,
+        _load_accounts_rows,
+        _find_account,
+        _parse_balance_to_decimal,
+        _fmt_amount_comma2,
+    )
+else:
+    logger.warning("FORM_PAY_* не настроены: /pay будет недоступна.")
 
 
 # -----------------------------
@@ -318,10 +306,16 @@ def build_telegram_app() -> Application:
     tga.add_handler(CommandHandler("start", start))
     tga.add_handler(CommandHandler("help", help_cmd))
     tga.add_handler(CommandHandler("balance", balance))
-    tga.add_handler(CommandHandler("price", price))
-    tga.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, price_followup_listener))
-    tga.add_handler(CommandHandler("pay", pay))
-    tga.add_handler(CommandHandler("ops", ops))
+
+    if GID_PRICES:
+        tga.add_handler(CommandHandler("price", price))
+        tga.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, price_followup_listener))
+
+    if _pay_ready:
+        tga.add_handler(CommandHandler("pay", pay))
+
+    if GID_OPS:
+        tga.add_handler(CommandHandler("ops", ops))
 
     return tga
 
