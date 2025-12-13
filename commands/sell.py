@@ -1,22 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""commands/sell.py
-
-Команда /sell:
-  /sell <товар> <кол-во> <цена>
-
-Пример:
-  /sell алмаз 20 45
-  -> бот ищет наиболее похожий товар в таблице товаров (лист цен/товаров),
-     спрашивает подтверждение,
-     после "да" отправляет Google Form.
-
-Принцип:
-- bot.py регистрирует хендлеры
-- команда сама проверяет env и сообщает пользователю, если конфигурации нет
-"""
-
 import os
 import re
 import csv
@@ -136,17 +120,17 @@ def _load_sell_cfg():
     if _cfg is not None:
         return _cfg
 
-    form_id = _optional_env("FORM_SELL_ID")
+    form_id = _optional_env("FORM_OPS_ID")
     if not form_id:
         _cfg = None
         return None
 
-    entry_op_id = _optional_env("FORM_SELL_ENTRY_OP_ID")
-    entry_user = _optional_env("FORM_SELL_ENTRY_USER")
-    entry_type = _optional_env("FORM_SELL_ENTRY_TYPE")
-    entry_item = _optional_env("FORM_SELL_ENTRY_ITEM")
-    entry_qty = _optional_env("FORM_SELL_ENTRY_QTY")
-    entry_price = _optional_env("FORM_SELL_ENTRY_PRICE")
+    entry_op_id = _optional_env("FORM_OPS_ENTRY_OP_ID")
+    entry_user = _optional_env("FORM_OPS_ENTRY_USER")
+    entry_type = _optional_env("FORM_OPS_ENTRY_TYPE")
+    entry_item = _optional_env("FORM_OPS_ENTRY_ITEM")
+    entry_qty = _optional_env("FORM_OPS_ENTRY_QTY")
+    entry_price = _optional_env("FORM_OPS_ENTRY_PRICE")
 
     if not all([entry_op_id, entry_user, entry_type, entry_item, entry_qty, entry_price]):
         _cfg = None
