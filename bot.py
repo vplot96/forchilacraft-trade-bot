@@ -22,7 +22,6 @@ from commands.balance import balance, init_balance_helpers
 from commands.price import price, price_followup_listener, init_price_helpers
 from commands.pay import pay as pay_cmd, init_pay_helpers
 from commands.ops import ops, init_ops_helpers
-from commands.sell import get_handlers as get_sell_handlers
 
 
 # -----------------------------
@@ -33,7 +32,6 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
-
 
 
 
@@ -314,19 +312,12 @@ def build_telegram_app() -> Application:
     tga.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, price_followup_listener))
     tga.add_handler(CommandHandler("pay", pay))
     tga.add_handler(CommandHandler("ops", ops))
+    async def _on_error(update, context):
+        logger.exception("Unhandled error", exc_info=context.error)
 
-    # /sell handlers
-    for h in get_sell_handlers():
-        tga.add_handler(h)
-
-async def _on_error(update, context):
-    logger.exception("Unhandled error", exc_info=context.error)
-
-tga.add_error_handler(_on_error)
+    tga.add_error_handler(_on_error)
     # Cancel any pending_* when user sends a command (runs after command handlers)
     tga.add_handler(MessageHandler(filters.COMMAND, cancel_pending_on_any_command), group=99)
-
-    
     return tga
 
 
