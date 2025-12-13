@@ -20,7 +20,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 from commands.help import help_cmd
 from commands.balance import balance, init_balance_helpers
 from commands.price import price, price_followup_listener, init_price_helpers
-from commands.pay import pay, init_pay_helpers
+from commands.pay import pay as pay_cmd, init_pay_helpers
 from commands.ops import ops, init_ops_helpers
 
 
@@ -28,7 +28,7 @@ from commands.ops import ops, init_ops_helpers
 # Logging
 # -----------------------------
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format="%(asctime)s - %(name)s - %(levelname)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
@@ -64,13 +64,13 @@ BOT_TOKEN = require_env("BOT_TOKEN")
 SHEET_ID = require_env("SHEET_ID")
 GID_ACCOUNTS = require_env("GID_ACCOUNTS")
 
-# Эти листы нужны не всегда — команды будут подключаться только если они заданы
+# Эти env могут отсутствовать — команды сами сообщат, что недоступны
 GID_PRICES = optional_env("GID_PRICES")
 GID_OPS = optional_env("GID_OPS")
 
 
 # -----------------------------
-# Общие хелперы (таблица/форматирование)
+# Общие хелперы
 # -----------------------------
 def normalize(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip()).lower()
@@ -143,7 +143,6 @@ def _load_accounts_rows():
 # /price helpers
 # -----------------------------
 def _split_query_and_qty(text: str):
-    # "алмаз" -> ("алмаз", None) ; "алмаз 10" -> ("алмаз", 10)
     raw = (text or "").strip()
     if not raw:
         return "", None
@@ -172,16 +171,12 @@ def _fmt_total(product_name: str, unit_price: Decimal, qty: int | None) -> str:
 def lookup_price_by_product_name(query: str):
     if not GID_PRICES:
         return None
-
     q = normalize(query)
     if not q:
         return None
-
     rows = fetch_rows(GID_PRICES)
-
     name_cols = ("Название товара", "Название в игре", "Название", "Товар")
     price_cols = ("Текущая цена", "Цена", "Стоимость", "Cost", "Price")
-
     for r in rows:
         name_val = None
         for c in name_cols:
@@ -191,7 +186,6 @@ def lookup_price_by_product_name(query: str):
                 break
         if not name_val or normalize(name_val) != q:
             continue
-
         price_val = None
         for c in price_cols:
             v = str(r.get(c) or "").strip()
@@ -200,9 +194,7 @@ def lookup_price_by_product_name(query: str):
                 break
         if price_val is None:
             continue
-
         return (name_val, _money_to_decimal(price_val))
-
     return None
 
 
@@ -226,22 +218,18 @@ def _parse_date_safe(value: str):
 
 
 def _format_op_line(row: dict) -> str:
-    # Колонки листа "Операции": Название, Операция, Число, Сумма, Пользователь, Дата
     name = str(row.get("Название", "") or "").strip()
     op = str(row.get("Операция", "") or "").strip()
     qty_raw = row.get("Число", "")
     sum_raw = row.get("Сумма", "")
     date_raw = row.get("Дата", "")
-
     qty = int(_parse_decimal(qty_raw)) if str(qty_raw or "").strip() else 0
     amount = _parse_balance_to_decimal(sum_raw)
     date_dt = _parse_date_safe(date_raw)
     date_str = date_dt.strftime("%d.%m.%y") if date_dt else str(date_raw or "").strip()
-
     is_buy = normalize(op) == "покупка"
     sign = "−" if is_buy else "+"
     amount_str = _fmt_amount_trim(amount)
-
     return f'{date_str} {op} "{name}" ({qty}): {sign}{amount_str} джк'
 
 
@@ -253,39 +241,38 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # -----------------------------
-# Инициализация хелперов для команд
-# (пока оставляем, чтобы не ломать существующие команды;
-#  дальше мы сможем переносить логику внутрь самих команд)
+# Инициализация базовых команд
 # -----------------------------
 init_balance_helpers(_load_accounts_rows, _find_account, _parse_balance_to_decimal)
-
-# price и ops подключаем только если заданы нужные GID
-if GID_PRICES:
-    init_price_helpers(lookup_price_by_product_name, _split_query_and_qty, _money_to_decimal, _fmt_total)
-else:
-    logger.warning("GID_PRICES is not set: /price будет недоступна.")
-
-if GID_OPS:
-    init_ops_helpers(_load_accounts_rows, _find_account, _fetch_ops_rows, _parse_date_safe, _format_op_line)
-else:
-    logger.warning("GID_OPS is not set: /ops будет недоступна.")
+init_price_helpers(lookup_price_by_product_name, _split_query_and_qty, _money_to_decimal, _fmt_total)
+init_ops_helpers(_load_accounts_rows, _find_account, _fetch_ops_rows, _parse_date_safe, _format_op_line)
 
 
-# pay-конфиг читаем явно, но делаем опциональным — чтобы bot.py не падал, пока ты перекладываешь pay внутрь команды
-FORM_PAY_ID = optional_env("FORM_PAY_ID")
-FORM_PAY_ENTRY_SENDER = optional_env("FORM_PAY_ENTRY_SENDER")
-FORM_PAY_ENTRY_RECIPIENT = optional_env("FORM_PAY_ENTRY_RECIPIENT")
-FORM_PAY_ENTRY_SUM = optional_env("FORM_PAY_ENTRY_SUM")
-FORM_PAY_POST_URL = f"https://docs.google.com/forms/d/e/{FORM_PAY_ID}/formResponse" if FORM_PAY_ID else None
+# -----------------------------
+# Lazy init для /pay (bot.py НЕ проверяет env заранее и НЕ отключает команду)
+# -----------------------------
+_pay_inited = False
 
-_pay_ready = all([FORM_PAY_ID, FORM_PAY_ENTRY_SENDER, FORM_PAY_ENTRY_RECIPIENT, FORM_PAY_ENTRY_SUM, FORM_PAY_POST_URL])
-if _pay_ready:
+def _try_init_pay():
+    global _pay_inited
+    if _pay_inited:
+        return True
+
+    form_id = optional_env("FORM_PAY_ID")
+    entry_sender = optional_env("FORM_PAY_ENTRY_SENDER")
+    entry_recipient = optional_env("FORM_PAY_ENTRY_RECIPIENT")
+    entry_sum = optional_env("FORM_PAY_ENTRY_SUM")
+
+    if not all([form_id, entry_sender, entry_recipient, entry_sum]):
+        return False
+
+    post_url = f"https://docs.google.com/forms/d/e/{form_id}/formResponse"
     init_pay_helpers(
-        FORM_PAY_ID,
-        FORM_PAY_ENTRY_SENDER,
-        FORM_PAY_ENTRY_RECIPIENT,
-        FORM_PAY_ENTRY_SUM,
-        FORM_PAY_POST_URL,
+        form_id,
+        entry_sender,
+        entry_recipient,
+        entry_sum,
+        post_url,
         normalize,
         _parse_amount_arg,
         _load_accounts_rows,
@@ -293,8 +280,15 @@ if _pay_ready:
         _parse_balance_to_decimal,
         _fmt_amount_comma2,
     )
-else:
-    logger.warning("FORM_PAY_* не настроены: /pay будет недоступна.")
+    _pay_inited = True
+    return True
+
+
+async def pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _try_init_pay():
+        await update.message.reply_text("Команда /pay временно недоступна: не настроены переменные окружения.")
+        return
+    await pay_cmd(update, context)
 
 
 # -----------------------------
@@ -302,34 +296,23 @@ else:
 # -----------------------------
 def build_telegram_app() -> Application:
     tga = Application.builder().token(BOT_TOKEN).build()
-
     tga.add_handler(CommandHandler("start", start))
     tga.add_handler(CommandHandler("help", help_cmd))
     tga.add_handler(CommandHandler("balance", balance))
-
-    if GID_PRICES:
-        tga.add_handler(CommandHandler("price", price))
-        tga.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, price_followup_listener))
-
-    if _pay_ready:
-        tga.add_handler(CommandHandler("pay", pay))
-
-    if GID_OPS:
-        tga.add_handler(CommandHandler("ops", ops))
-
+    tga.add_handler(CommandHandler("price", price))
+    tga.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, price_followup_listener))
+    tga.add_handler(CommandHandler("pay", pay))
+    tga.add_handler(CommandHandler("ops", ops))
     return tga
 
 
 async def _telegram_runner():
     global tg_app
     tg_app = build_telegram_app()
-
     await tg_app.initialize()
     await tg_app.start()
-
     if tg_app.updater is None:
-        raise RuntimeError("Telegram Application.updater is None. Проверь версию python-telegram-bot (polling должен поддерживаться).")
-
+        raise RuntimeError("Telegram Application.updater is None. Проверь версию python-telegram-bot.")
     await tg_app.updater.start_polling()
     await tg_app.updater.idle()
 
