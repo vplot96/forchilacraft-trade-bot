@@ -35,6 +35,16 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+
+
+async def cancel_pending_on_any_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Одна очередь ожидания на пользователя: сбрасываем любые pending_* при любой команде.
+    if not context or not getattr(context, "user_data", None):
+        return
+    for k in list(context.user_data.keys()):
+        if isinstance(k, str) and k.startswith("pending_"):
+            context.user_data.pop(k, None)
+
 # -----------------------------
 # FastAPI app (для платформ, которые ожидают web-процесс)
 # -----------------------------
@@ -308,6 +318,14 @@ def build_telegram_app() -> Application:
     # /sell handlers
     for h in get_sell_handlers():
         tga.add_handler(h)
+
+async def _on_error(update, context):
+    logger.exception("Unhandled error", exc_info=context.error)
+
+tga.add_error_handler(_on_error)
+    # Cancel any pending_* when user sends a command (runs after command handlers)
+    tga.add_handler(MessageHandler(filters.COMMAND, cancel_pending_on_any_command), group=99)
+
     
     return tga
 
