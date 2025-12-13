@@ -163,6 +163,28 @@ def _clear_pending(context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop(_PENDING_KEY, None)
 
 
+def _strip_trailing_punct(s: str) -> str:
+    # Accept final '.' and/or '!' (one or many), e.g. "да!", "да..", "нет!"
+    return re.sub(r"[.!]+$", "", (s or "").strip())
+
+
+def _is_yes(text: str) -> bool:
+    t = _strip_trailing_punct(text).lower()
+    return t in ("да", "yes", "y")
+
+
+def _is_no(text: str) -> bool:
+    t = _strip_trailing_punct(text).lower()
+    return t in ("нет", "no", "n")
+
+
+async def _cancel_pending_on_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # If user is in pending state and sends ANY command, silently cancel pending.
+    if _get_pending(context):
+        _clear_pending(context)
+
+
+
 async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cfg = _load_sell_cfg()
     if cfg is None:
@@ -240,9 +262,9 @@ async def sell_confirm_listener(update: Update, context: ContextTypes.DEFAULT_TY
     if not pending:
         return
 
-    text = (update.message.text or "").strip().lower()
+    text = (update.message.text or "").strip()
 
-    if text in ("да", "yes", "y"):
+    if _is_yes(text):
         cfg = _load_sell_cfg()
         if cfg is None:
             _clear_pending(context)
@@ -273,16 +295,17 @@ async def sell_confirm_listener(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("Операция продажи отправлена.")
         return
 
-    if text in ("нет", "no", "n"):
+    if _is_no(text):
         _clear_pending(context)
         await update.message.reply_text("Ок, отменено.")
         return
 
-    await update.message.reply_text('Пожалуйста, ответьте "да" или "нет".')
+    await update.message.reply_text("Мне нужен чёткий ответ.")
 
 
 def get_handlers():
     return [
+        MessageHandler(filters.COMMAND, _cancel_pending_on_command),
         CommandHandler("sell", sell),
         MessageHandler(filters.TEXT & ~filters.COMMAND, sell_confirm_listener),
     ]
