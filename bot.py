@@ -14,7 +14,13 @@ import requests
 from fastapi import FastAPI
 import uvicorn
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 # Команды (папка commands/ должна содержать __init__.py)
 from commands.help import help_cmd
@@ -22,6 +28,7 @@ from commands.balance import balance, init_balance_helpers
 from commands.price import price, price_followup_listener, init_price_helpers
 from commands.pay import pay as pay_cmd, init_pay_helpers
 from commands.ops import ops, init_ops_helpers
+from commands.sell import sell, sell_confirm_listener
 
 
 # -----------------------------
@@ -33,15 +40,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
-
-async def cancel_pending_on_any_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Одна очередь ожидания на пользователя: сбрасываем любые pending_* при любой команде.
-    if not context or not getattr(context, "user_data", None):
-        return
-    for k in list(context.user_data.keys()):
-        if isinstance(k, str) and k.startswith("pending_"):
-            context.user_data.pop(k, None)
 
 # -----------------------------
 # FastAPI app (для платформ, которые ожидают web-процесс)
@@ -126,14 +124,8 @@ def _fmt_amount_comma2(amount: Decimal) -> str:
 
 
 def _fmt_amount_trim(amount: Decimal) -> str:
-    # 12,00 -> 12 ; 12,50 -> 12,5 ; 12,75 -> 12,75
     s = _fmt_amount_comma2(amount)
-    if s.endswith(",00"):
-        return s[:-3]
-    s = s.rstrip("0")
-    if s.endswith(","):
-        s = s[:-1]
-    return s
+    return s[:-3] if s.endswith(",00") else s
 
 
 def _find_account(rows, username: str):
@@ -149,43 +141,45 @@ def _load_accounts_rows():
 
 
 # -----------------------------
-# /price helpers
+# Хелперы для /price (подключаются через init_price_helpers)
 # -----------------------------
-def _split_query_and_qty(text: str):
-    raw = (text or "").strip()
-    if not raw:
-        return "", None
+def _money_to_decimal(value) -> Decimal:
+    s = str(value or "").strip().replace(" ", "").replace(",", ".")
+    if not s:
+        return Decimal("0.00")
+    try:
+        q = Decimal(s)
+    except Exception:
+        q = Decimal("0.00")
+    return q.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def _split_query_and_qty(raw: str):
+    raw = (raw or "").strip()
     m = re.match(r"^(.*?)(?:\s+(\d+))?$", raw)
     if not m:
-        return raw, None
-    name = (m.group(1) or "").strip()
-    qty_str = m.group(2)
-    qty = int(qty_str) if qty_str is not None else None
-    if qty is not None and qty <= 0:
-        qty = None
-    return name, qty
-
-
-def _money_to_decimal(value) -> Decimal:
-    return _parse_balance_to_decimal(value)
-
-
-def _fmt_total(product_name: str, unit_price: Decimal, qty: int | None) -> str:
-    if qty is None:
-        return f"{product_name} = {_fmt_amount_trim(unit_price)} джк"
-    total = (unit_price * Decimal(qty)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    return f"{product_name} ({qty}) = {_fmt_amount_trim(total)} джк"
+        return raw, None, False
+    query = (m.group(1) or "").strip()
+    qty_s = m.group(2)
+    if qty_s is None:
+        return query, None, False
+    try:
+        qty = int(qty_s)
+    except Exception:
+        return query, None, False
+    return query, qty, True
 
 
 def lookup_price_by_product_name(query: str):
     if not GID_PRICES:
         return None
-    q = normalize(query)
-    if not q:
-        return None
+
     rows = fetch_rows(GID_PRICES)
-    name_cols = ("Название товара", "Название в игре", "Название", "Товар")
-    price_cols = ("Текущая цена", "Цена", "Стоимость", "Cost", "Price")
+    q = normalize(query)
+
+    name_cols = ("Название", "Name", "Товар", "Название товара")
+    price_cols = ("Цена", "Курс", "Price", "Текущая цена")
+
     for r in rows:
         name_val = None
         for c in name_cols:
@@ -193,8 +187,11 @@ def lookup_price_by_product_name(query: str):
             if v:
                 name_val = v
                 break
-        if not name_val or normalize(name_val) != q:
+        if not name_val:
             continue
+        if normalize(name_val) != q:
+            continue
+
         price_val = None
         for c in price_cols:
             v = str(r.get(c) or "").strip()
@@ -203,12 +200,21 @@ def lookup_price_by_product_name(query: str):
                 break
         if price_val is None:
             continue
+
         return (name_val, _money_to_decimal(price_val))
+
     return None
 
 
+def _fmt_total(name: str, unit: Decimal, qty: int | None, qty_specified: bool) -> str:
+    if not qty_specified or qty is None:
+        return f"{name} = {_fmt_amount_trim(unit)} джк"
+    total = (unit * Decimal(qty)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return f"{name} ({qty}) = {_fmt_amount_trim(total)} джк"
+
+
 # -----------------------------
-# /ops helpers
+# Хелперы для /ops
 # -----------------------------
 def _fetch_ops_rows():
     if not GID_OPS:
@@ -232,13 +238,16 @@ def _format_op_line(row: dict) -> str:
     qty_raw = row.get("Число", "")
     sum_raw = row.get("Сумма", "")
     date_raw = row.get("Дата", "")
+
     qty = int(_parse_decimal(qty_raw)) if str(qty_raw or "").strip() else 0
     amount = _parse_balance_to_decimal(sum_raw)
     date_dt = _parse_date_safe(date_raw)
     date_str = date_dt.strftime("%d.%m.%y") if date_dt else str(date_raw or "").strip()
+
     is_buy = normalize(op) == "покупка"
     sign = "−" if is_buy else "+"
     amount_str = _fmt_amount_trim(amount)
+
     return f'{date_str} {op} "{name}" ({qty}): {sign}{amount_str} джк'
 
 
@@ -250,19 +259,33 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # -----------------------------
-# Инициализация базовых команд
+# Инициализация хелперов для команд
 # -----------------------------
 init_balance_helpers(_load_accounts_rows, _find_account, _parse_balance_to_decimal)
-init_price_helpers(lookup_price_by_product_name, _split_query_and_qty, _money_to_decimal, _fmt_total)
-init_ops_helpers(_load_accounts_rows, _find_account, _fetch_ops_rows, _parse_date_safe, _format_op_line)
+
+init_price_helpers(
+    lookup_price_by_product_name,
+    _split_query_and_qty,
+    _money_to_decimal,
+    _fmt_total,
+)
+
+init_ops_helpers(
+    _load_accounts_rows,
+    _find_account,
+    _fetch_ops_rows,
+    _parse_date_safe,
+    _format_op_line,
+)
 
 
 # -----------------------------
-# Lazy init для /pay (bot.py НЕ проверяет env заранее и НЕ отключает команду)
+# Lazy init для /pay
 # -----------------------------
 _pay_inited = False
 
-def _try_init_pay():
+
+def _try_init_pay() -> bool:
     global _pay_inited
     if _pay_inited:
         return True
@@ -301,23 +324,74 @@ async def pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # -----------------------------
+# Unified "single queue" mechanics
+# -----------------------------
+def _clear_pending_all(context: ContextTypes.DEFAULT_TYPE):
+    for k in list(context.user_data.keys()):
+        if isinstance(k, str) and k.startswith("pending_"):
+            context.user_data.pop(k, None)
+
+
+async def _pre_command_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Сбрасываем ожидание при вводе ЛЮБОЙ команды.
+    if context is None:
+        return
+    _clear_pending_all(context)
+
+
+async def _unified_text_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None or context is None:
+        return
+
+    # Приоритет: sell подтверждение важнее, чем price
+    if context.user_data.get("pending_sell") is not None:
+        try:
+            await sell_confirm_listener(update, context)
+        except Exception:
+            logger.exception("Unhandled error in sell_confirm_listener")
+            await update.message.reply_text("Произошла ошибка при обработке ответа. Попробуйте ещё раз.")
+        return
+
+    if context.user_data.get("pending_price") is not None:
+        try:
+            await price_followup_listener(update, context)
+        except Exception:
+            logger.exception("Unhandled error in price_followup_listener")
+            await update.message.reply_text("Произошла ошибка при обработке ответа. Попробуйте ещё раз.")
+        return
+
+    return
+
+
+async def _on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.exception("Unhandled error", exc_info=context.error)
+
+
+# -----------------------------
 # Telegram app builder
 # -----------------------------
 def build_telegram_app() -> Application:
     tga = Application.builder().token(BOT_TOKEN).build()
-    tga.add_handler(CommandHandler("start", start))
-    tga.add_handler(CommandHandler("help", help_cmd))
-    tga.add_handler(CommandHandler("balance", balance))
-    tga.add_handler(CommandHandler("price", price))
-    tga.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, price_followup_listener))
-    tga.add_handler(CommandHandler("pay", pay))
-    tga.add_handler(CommandHandler("ops", ops))
-    async def _on_error(update, context):
-        logger.exception("Unhandled error", exc_info=context.error)
 
+    # 1) Предварительный сброс ожиданий на любую команду.
+    # Важно: block=False, иначе команды не будут выполняться.
+    tga.add_handler(MessageHandler(filters.COMMAND, _pre_command_cancel, block=False), group=0)
+
+    # 2) Команды
+    tga.add_handler(CommandHandler("start", start), group=1)
+    tga.add_handler(CommandHandler("help", help_cmd), group=1)
+    tga.add_handler(CommandHandler("balance", balance), group=1)
+    tga.add_handler(CommandHandler("price", price), group=1)
+    tga.add_handler(CommandHandler("pay", pay), group=1)
+    tga.add_handler(CommandHandler("ops", ops), group=1)
+    tga.add_handler(CommandHandler("sell", sell), group=1)
+
+    # 3) Один listener для ответов на интерактивные команды
+    tga.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _unified_text_listener), group=2)
+
+    # 4) Ошибки в логи
     tga.add_error_handler(_on_error)
-    # Cancel any pending_* when user sends a command (runs after command handlers)
-    tga.add_handler(MessageHandler(filters.COMMAND, cancel_pending_on_any_command), group=99)
+
     return tga
 
 
