@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import os
+import asyncio
 import re
 import csv
 import uuid
@@ -77,14 +78,15 @@ def _fetch_rows(sheet_id: str, gid: str):
     return list(csv.DictReader(StringIO(text)))
 
 
-def _best_match_product(rows: list[dict], query: str) -> Optional[str]:
+def _best_match_product(rows: list[dict], query: str) -> Optional[dict]:
     q = _normalize(query)
     if not q:
         return None
 
-    name_cols = ("Название товара", "Название в игре", "Название", "Товар")
+    name_cols = ("Название", "Название товара", "Название в игре", "Товар", "Name")
+    id_cols = ("Id товара", "ID товара", "ItemId", "ProductId", "ID")
 
-    best_name = None
+    best = None
     best_score = 0.0
 
     for row in rows:
@@ -97,18 +99,23 @@ def _best_match_product(rows: list[dict], query: str) -> Optional[str]:
         if not name_val:
             continue
 
-        n = _normalize(name_val)
-
-        if n == q:
-            return name_val
-
-        score = SequenceMatcher(None, n, q).ratio()
+        score = SequenceMatcher(None, q, _normalize(name_val)).ratio()
         if score > best_score:
-            best_score = score
-            best_name = name_val
+            # Попробуем достать id
+            item_id = None
+            for c in id_cols:
+                v = str(row.get(c) or "").strip()
+                if v:
+                    item_id = v
+                    break
 
-    if best_name and best_score >= 0.55:
-        return best_name
+            best_score = score
+            best = {"id": item_id, "name": name_val}
+
+    # Порог совпадения
+    if best and best_score >= 0.55 and best.get("id"):
+        return best
+
     return None
 
 
@@ -162,26 +169,6 @@ def _get_pending(context: ContextTypes.DEFAULT_TYPE) -> Optional[dict]:
 def _clear_pending(context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop(_PENDING_KEY, None)
 
-def _strip_trailing_punct(s: str) -> str:
-    # Принимаем '.', '!' на конце (один или несколько): "да!", "да..", "нет!!"
-    return re.sub(r"[.!]+$", "", (s or "").strip())
-
-
-def _is_yes(text: str) -> bool:
-    t = _strip_trailing_punct(text).strip().lower()
-    return t == "да"
-
-
-def _is_no(text: str) -> bool:
-    t = _strip_trailing_punct(text).strip().lower()
-    return t == "нет"
-
-
-async def _cancel_pending_on_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if _get_pending(context):
-        _clear_pending(context)
-
-
 
 async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cfg = _load_sell_cfg()
@@ -190,9 +177,9 @@ async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     sheet_id = _optional_env("SHEET_ID")
-    gid_prices = _optional_env("GID_PRICES")
-    if not sheet_id or not gid_prices:
-        await update.message.reply_text("Команда /sell временно недоступна: не настроены переменные таблицы товаров.")
+    gid_products = _optional_env("GID_PRODUCTS")
+    if not sheet_id or not gid_products:
+        await update.message.reply_text("Команда /sell временно недоступна: не настроены переменные таблицы товаров (GID_PRODUCTS).")
         return
 
     if not context.args or len(context.args) < 3:
@@ -230,39 +217,39 @@ async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sender_username = f"@{sender_u}"
 
     try:
-        rows = _fetch_rows(sheet_id, gid_prices)
+        rows = _fetch_rows(sheet_id, gid_products)
     except Exception:
         await update.message.reply_text("Не удалось получить список товаров. Попробуйте позже.")
         return
 
-    matched_name = _best_match_product(rows, raw_item)
-    if not matched_name:
-        await update.message.reply_text("Не удалось найти подходящий товар. Попробуйте уточнить название.")
-        return
+    matched = _best_match_product(rows, raw_item)
+if not matched:
+    await update.message.reply_text("Не удалось найти подходящий товар. Попробуйте уточнить название.")
+    return
 
-    pending = {
-        "op_id": str(uuid.uuid4()),
-        "user": sender_username,
-        "type": "Продажа",
-        "item": matched_name,
-        "qty": qty,
-        "price": price,
-    }
-    _set_pending(context, pending)
+pending = {
+    "op_id": str(uuid.uuid4()),
+    "user": sender_username,
+    "type": "sell",
+    "item_id": matched["id"],
+    "item_name": matched["name"],
+    "qty": qty,
+    "price": price,
+}
+_set_pending(context, pending)
 
-    await update.message.reply_text(
-        f'Вы собираетесь продать {matched_name} в количестве {qty} по {_fmt_money_human(price)}?\nОтветьте "да" или "нет".'
-    )
-
-
+await update.message.reply_text(
+    f'Вы собираетесь продать {pending["item_name"]} в количестве {qty} по {_fmt_money_human(price)}?
+Ответьте "да" или "нет".'
+)
 async def sell_confirm_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pending = _get_pending(context)
     if not pending:
         return
 
-    text = (update.message.text or "").strip()
+    text = (update.message.text or "").strip().lower()
 
-    if _is_yes(text):
+    if text in ("да", "yes", "y"):
         cfg = _load_sell_cfg()
         if cfg is None:
             _clear_pending(context)
@@ -273,13 +260,13 @@ async def sell_confirm_listener(update: Update, context: ContextTypes.DEFAULT_TY
             cfg["entry_op_id"]: pending["op_id"],
             cfg["entry_user"]: pending["user"],
             cfg["entry_type"]: pending["type"],
-            cfg["entry_item"]: pending["item"],
+            cfg["entry_item"]: pending["item_id"],
             cfg["entry_qty"]: str(pending["qty"]),
             cfg["entry_price"]: _fmt_money_form(pending["price"]),
         }
 
         try:
-            r = requests.post(cfg["post_url"], data=payload, timeout=20)
+            r = await asyncio.to_thread(requests.post, cfg["post_url"], data=payload, timeout=20)
             if r.status_code >= 400:
                 _clear_pending(context)
                 await update.message.reply_text("Не удалось отправить операцию. Попробуйте позже.")
@@ -293,12 +280,12 @@ async def sell_confirm_listener(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("Операция продажи отправлена.")
         return
 
-    if _is_no(text):
+    if text in ("нет", "no", "n"):
         _clear_pending(context)
         await update.message.reply_text("Ок, отменено.")
         return
 
-    await update.message.reply_text("Мне нужен чёткий ответ.")
+    await update.message.reply_text('Пожалуйста, ответьте "да" или "нет".')
 
 
 def get_handlers():
