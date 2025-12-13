@@ -1,3 +1,13 @@
+def _submit_form(url: str, payload: dict) -> tuple[int, str]:
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": "forchilacraft-trade-bot/1.0",
+    }
+    r = requests.post(url, data=payload, headers=headers, timeout=20, allow_redirects=True)
+    preview = (r.text or "")[:500]
+    return r.status_code, preview
+
+import asyncio
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
@@ -5,8 +15,6 @@ import os
 import re
 import csv
 import uuid
-import asyncio
-import logging
 from io import StringIO
 from decimal import Decimal, ROUND_HALF_UP
 from difflib import SequenceMatcher
@@ -20,8 +28,6 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-
-logger = logging.getLogger(__name__)
 
 
 def _require_env(name: str) -> str:
@@ -75,15 +81,10 @@ def _csv_url(sheet_id: str, gid: str) -> str:
 
 
 def _fetch_rows(sheet_id: str, gid: str):
-    r = requests.get(_csv_url(sheet_id, gid), timeout=10)
+    r = requests.get(_csv_url(sheet_id, gid), timeout=20)
     r.raise_for_status()
     text = r.content.decode("utf-8-sig")
     return list(csv.DictReader(StringIO(text)))
-
-
-async def _fetch_rows_async(sheet_id: str, gid: str):
-    # requests.get блокирует event loop, поэтому выносим в thread
-    return await asyncio.to_thread(_fetch_rows, sheet_id, gid)
 
 
 def _best_match_product(rows: list[dict], query: str) -> Optional[str]:
@@ -118,25 +119,6 @@ def _best_match_product(rows: list[dict], query: str) -> Optional[str]:
 
     if best_name and best_score >= 0.55:
         return best_name
-def _best_match_product_row(rows: list[dict], query: str) -> Optional[dict]:
-    # Ищем по колонке "Название" (PRODUCTS), возвращаем всю строку
-    q = _normalize(query)
-    best_row = None
-    best_score = 0.0
-    for row in rows:
-        name_val = str(row.get("Название") or "").strip()
-        if not name_val:
-            continue
-        n = _normalize(name_val)
-        if n == q:
-            return row
-        score = SequenceMatcher(None, q, n).ratio()
-        if score > best_score:
-            best_score = score
-            best_row = row
-    if best_score >= 0.45:
-        return best_row
-    return None
     return None
 
 
@@ -218,8 +200,8 @@ async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     sheet_id = _optional_env("SHEET_ID")
-    gid_products = _optional_env("GID_PRODUCTS")
-    if not sheet_id or not gid_products:
+    gid_prices = _optional_env("GID_PRICES")
+    if not sheet_id or not gid_prices:
         await update.message.reply_text("Команда /sell временно недоступна: не настроены переменные таблицы товаров.")
         return
 
@@ -258,87 +240,68 @@ async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sender_username = f"@{sender_u}"
 
     try:
-        logger.info("SELL: fetching PRODUCTS gid=%s", gid_products)
-        rows = await _fetch_rows_async(sheet_id, gid_products)
-        logger.info("SELL: fetched %d products", len(rows))
-    except Exception as e:
-        logger.exception("SELL: failed to fetch PRODUCTS")
-        await update.message.reply_text("Не удалось получить список товаров (PRODUCTS). Попробуйте позже.")
+        rows = _fetch_rows(sheet_id, gid_prices)
+    except Exception:
+        await update.message.reply_text("Не удалось получить список товаров. Попробуйте позже.")
         return
 
-    matched_row = _best_match_product_row(rows, raw_item)
-    if not matched_row:
+    matched_name = _best_match_product(rows, raw_item)
+    if not matched_name:
         await update.message.reply_text("Не удалось найти подходящий товар. Попробуйте уточнить название.")
-        return
-
-    matched_product_name = str(matched_row.get("Название") or "").strip()
-    matched_product_id = str(matched_row.get("Id товара") or "").strip()
-    if not matched_product_name or not matched_product_id:
-        await update.message.reply_text("Товар найден, но в таблице отсутствует «Название» или «Id товара».")
         return
 
     pending = {
         "op_id": str(uuid.uuid4()),
         "user": sender_username,
-        "type": "sell",
-        "product_name": matched_product_name,
-        "product_id": matched_product_id,
+        "type": "Продажа",
+        "item": matched_name,
         "qty": qty,
         "price": price,
     }
     _set_pending(context, pending)
 
     await update.message.reply_text(
-        f'Вы собираетесь продать {matched_product_name} в количестве {qty} по {_fmt_money_human(price)}?\nОтветьте "да" или "нет".'
+        f'Вы собираетесь продать {matched_name} в количестве {qty} по {_fmt_money_human(price)}?\nОтветьте "да" или "нет".'
     )
 
 
 async def sell_confirm_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    pending = _get_pending(context)
+    if update.message is None or context is None:
+        return
+
+    pending = context.user_data.get(_PENDING_KEY)
     if not pending:
         return
 
     text = (update.message.text or "").strip()
 
     if _is_yes(text):
-        cfg = _load_sell_cfg()
-        if cfg is None:
-            _clear_pending(context)
-            await update.message.reply_text("Команда /sell временно недоступна: не настроены переменные окружения.")
-            return
-
-        payload = {
-            cfg["entry_op_id"]: pending["op_id"],
-            cfg["entry_user"]: pending["user"],
-            cfg["entry_type"]: pending["type"],
-            cfg["entry_item"]: pending["product_id"],
-            cfg["entry_qty"]: str(pending["qty"]),
-            cfg["entry_price"]: _fmt_money_form(pending["price"]),
-        }
-
         try:
-            r = requests.post(cfg["post_url"], data=payload, timeout=10)
-            if r.status_code >= 400:
-                _clear_pending(context)
+            form_url = pending["form_url"]
+            payload = pending["payload"]
+
+            status, body_preview = await asyncio.to_thread(_submit_form, form_url, payload)
+            logger.info("SELL: form submit status=%s preview=%r", status, body_preview[:200])
+
+            # Google Forms часто отвечает 200 или 302
+            if status not in (200, 302):
                 await update.message.reply_text("Не удалось отправить операцию. Попробуйте позже.")
                 return
-        except Exception:
-            logger.exception("SELL: form post failed")
-            _clear_pending(context)
-            await update.message.reply_text("Не удалось отправить операцию. Попробуйте позже.")
-            return
 
-        _clear_pending(context)
-        await update.message.reply_text("Операция продажи отправлена.")
+            await update.message.reply_text("Операция отправлена.")
+        except Exception:
+            logger.exception("SELL: failed to submit form")
+            await update.message.reply_text("Не удалось отправить операцию. Попробуйте позже.")
+        finally:
+            _clear_pending(context)
         return
 
     if _is_no(text):
         _clear_pending(context)
-        await update.message.reply_text("Ок, отменено.")
+        await update.message.reply_text("Операция отменена.")
         return
 
     await update.message.reply_text("Мне нужен чёткий ответ.")
-
 
 def get_handlers():
     return [
