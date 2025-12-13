@@ -22,6 +22,7 @@ from commands.balance import balance, init_balance_helpers
 from commands.price import price, price_followup_listener, init_price_helpers
 from commands.pay import pay as pay_cmd, init_pay_helpers
 from commands.ops import ops, init_ops_helpers
+from commands.sell import get_handlers as get_sell_handlers
 
 
 # -----------------------------
@@ -303,6 +304,11 @@ def build_telegram_app() -> Application:
     tga.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, price_followup_listener))
     tga.add_handler(CommandHandler("pay", pay))
     tga.add_handler(CommandHandler("ops", ops))
+
+    # /sell handlers
+    for h in get_sell_handlers():
+        tga.add_handler(h)
+    
     return tga
 
 
