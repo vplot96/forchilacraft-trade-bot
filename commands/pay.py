@@ -155,7 +155,7 @@ async def pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Использование: /pay <username> <сумма>")
         return
 
-    recipient_username = context.args[0].lstrip("@").strip()
+    recipient_username = context.args[0].strip()
     raw_sum = " ".join(context.args[1:]).strip()
 
     if not recipient_username:
