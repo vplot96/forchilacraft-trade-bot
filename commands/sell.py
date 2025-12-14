@@ -277,6 +277,7 @@ async def sell_confirm_listener(update: Update, context: ContextTypes.DEFAULT_TY
 
             status, body_preview = await asyncio.to_thread(_submit_form, form_url, payload)
             logger.info("SELL: form submit status=%s preview=%r", status, (body_preview or "")[:200])
+            await update.message.reply_text(f"DEBUG: status={status}\n{(preview or '')[:200]}")
 
             # Google Forms often returns 200 or 302
             if 200 <= status < 400:
