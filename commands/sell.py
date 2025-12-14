@@ -134,13 +134,14 @@ def _load_sell_cfg() -> Optional[dict]:
         return None
 
     _cfg = {
+        "form_id": form_id,
         "post_url": f"https://docs.google.com/forms/d/e/{form_id}/formResponse",
-        "entry_op_id": entry_op_id,
-        "entry_user": entry_user,
-        "entry_type": entry_type,
-        "entry_item": entry_item,
-        "entry_qty": entry_qty,
-        "entry_price": entry_price,
+        "entry_op_id": f"entry.{entry_op_id}",
+        "entry_user": f"entry.{entry_user}",
+        "entry_type": f"entry.{entry_type}",
+        "entry_item": f"entry.{entry_item}",
+        "entry_qty": f"entry.{entry_qty}",
+        "entry_price": f"entry.{entry_price}",
     }
     return _cfg
 
