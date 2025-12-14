@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""/sell command for Forchilacraft Trade Bot.
+
+Fixes included:
+- Never blocks the asyncio event loop: all requests (Google Sheets + Google Forms) run via asyncio.to_thread.
+- Stable pending structure (form_url + payload) that matches the confirm listener.
+- Proper logger so exceptions are visible in hosting logs.
+"""
+
 import os
 import re
 import csv
@@ -8,7 +16,7 @@ import uuid
 import asyncio
 import logging
 from io import StringIO
-from typing import Optional, Tuple, List
+from typing import Optional, List, Dict, Tuple
 from decimal import Decimal, ROUND_HALF_UP
 
 import requests
@@ -17,15 +25,8 @@ from telegram.ext import ContextTypes, CommandHandler, MessageHandler, filters
 
 logger = logging.getLogger(__name__)
 
-_cfg: Optional[dict] = None
 _PENDING_KEY = "pending_sell"
-
-
-def _require_env(name: str) -> str:
-    v = os.getenv(name)
-    if not v:
-        raise RuntimeError(f"Missing env var: {name}")
-    return v
+_cfg: Optional[dict] = None
 
 
 def _optional_env(name: str) -> Optional[str]:
@@ -50,7 +51,6 @@ def _parse_int(raw: str) -> int:
 
 def _parse_money(raw: str) -> Decimal:
     s = (raw or "").strip().replace(" ", "")
-    # allow both 12.34 and 12,34
     s = s.replace(",", ".")
     if not re.fullmatch(r"-?\d+(?:\.\d+)?", s):
         raise ValueError("bad money")
@@ -58,9 +58,8 @@ def _parse_money(raw: str) -> Decimal:
 
 
 def _fmt_money_form(v: Decimal) -> str:
-    # Google Forms often expects comma for decimals in RU locales
-    s = f"{v:.2f}"
-    return s.replace(".", ",")
+    # RU Google Forms often expects comma as decimal separator
+    return f"{v:.2f}".replace(".", ",")
 
 
 def _fmt_money_human(v: Decimal) -> str:
@@ -72,9 +71,9 @@ def _csv_url(sheet_id: str, gid: str) -> str:
     return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
 
 
-def _fetch_rows(sheet_id: str, gid: str) -> List[dict]:
+def _fetch_rows(sheet_id: str, gid: str) -> List[Dict[str, str]]:
     url = _csv_url(sheet_id, gid)
-    r = requests.get(url, timeout=20)
+    r = requests.get(url, timeout=25)
     r.raise_for_status()
 
     txt = r.text or ""
@@ -82,36 +81,38 @@ def _fetch_rows(sheet_id: str, gid: str) -> List[dict]:
     return list(reader)
 
 
-def _best_match_product(rows: List[dict], query: str) -> Optional[str]:
-    # Tries to match by "Название товара" or "Название в игре" (case-insensitive, whitespace-normalized)
+def _best_match_product(rows: List[Dict[str, str]], query: str) -> Optional[str]:
     q = _normalize(query)
     if not q:
         return None
 
+    # Typical column names in your sheet (RU) + a few fallbacks
     name_cols = ["Название товара", "Название в игре", "Название", "Товар", "Name"]
-    for r in rows:
-        name_val = None
-        for c in name_cols:
-            v = str(r.get(c) or "").strip()
-            if v:
-                name_val = v
-                break
-        if not name_val:
-            continue
-        if _normalize(name_val) == q:
-            return name_val
 
-    # fallback: contains
-    for r in rows:
+    def get_name(row: Dict[str, str]) -> str:
         for c in name_cols:
-            v = str(r.get(c) or "").strip()
-            if v and q in _normalize(v):
+            v = str(row.get(c) or "").strip()
+            if v:
                 return v
+        return ""
+
+    # 1) exact match
+    for row in rows:
+        name = get_name(row)
+        if name and _normalize(name) == q:
+            return name
+
+    # 2) contains match (first hit)
+    for row in rows:
+        name = get_name(row)
+        if name and q in _normalize(name):
+            return name
 
     return None
 
 
 def _load_sell_cfg() -> Optional[dict]:
+    """Loads Google Form configuration from env vars once."""
     global _cfg
     if _cfg is not None:
         return _cfg
@@ -171,24 +172,25 @@ def _submit_form(url: str, payload: dict) -> Tuple[int, str]:
         "Content-Type": "application/x-www-form-urlencoded",
         "User-Agent": "forchilacraft-trade-bot/1.0",
     }
-    r = requests.post(url, data=payload, headers=headers, timeout=20, allow_redirects=True)
+    r = requests.post(url, data=payload, headers=headers, timeout=25, allow_redirects=True)
     preview = (r.text or "")[:500]
     return r.status_code, preview
 
 
 async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Usage: /sell <товар> <количество> <цена>"""
     if update.message is None:
         return
 
     cfg = _load_sell_cfg()
     if cfg is None:
-        await update.message.reply_text("Команда /sell временно недоступна: не настроены переменные окружения.")
+        await update.message.reply_text("Команда /sell недоступна: не настроены переменные Google Forms.")
         return
 
     sheet_id = _optional_env("SHEET_ID")
     gid_prices = _optional_env("GID_PRICES")
     if not sheet_id or not gid_prices:
-        await update.message.reply_text("Команда /sell временно недоступна: не настроены переменные таблицы товаров.")
+        await update.message.reply_text("Команда /sell недоступна: не настроены переменные таблицы товаров (SHEET_ID/GID_PRICES).")
         return
 
     if not context.args or len(context.args) < 3:
@@ -202,7 +204,7 @@ async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         qty = _parse_int(raw_qty)
     except Exception:
-        await update.message.reply_text("Количество должно быть числом.")
+        await update.message.reply_text("Количество должно быть целым числом.")
         return
 
     if qty <= 0:
@@ -225,11 +227,15 @@ async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     sender_username = f"@{sender_u}"
 
+    # Quick ACK so you see bot is alive even if Google is slow
+    await update.message.reply_text("Проверяю товар в таблице...")
+
     try:
         rows = await asyncio.to_thread(_fetch_rows, sheet_id, gid_prices)
+        logger.info("SELL: fetched %s products", len(rows))
     except Exception:
         logger.exception("SELL: failed to fetch products from sheet")
-        await update.message.reply_text("Не удалось получить список товаров. Попробуйте позже.")
+        await update.message.reply_text("Не удалось получить список товаров (Google Sheets). Попробуйте позже.")
         return
 
     matched_name = _best_match_product(rows, raw_item)
@@ -237,7 +243,6 @@ async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f'Не нашёл товар по запросу: "{raw_item}". Проверьте название.')
         return
 
-    # IMPORTANT: pending MUST match what sell_confirm_listener reads
     op_id = str(uuid.uuid4())
     payload = {
         cfg["entry_op_id"]: op_id,
@@ -247,16 +252,16 @@ async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cfg["entry_qty"]: str(qty),
         cfg["entry_price"]: _fmt_money_form(price),
     }
-    pending = {"form_url": cfg["post_url"], "payload": payload}
-    _set_pending(context, pending)
+    _set_pending(context, {"form_url": cfg["post_url"], "payload": payload})
 
     await update.message.reply_text(
-        f'Вы собираетесь продать {matched_name} в количестве {qty} по {_fmt_money_human(price)}?\nОтветьте "да" или "нет".'
+        f'Вы собираетесь продать {matched_name} в количестве {qty} по {_fmt_money_human(price)}?\n'
+        'Ответьте "да" или "нет".'
     )
 
 
 async def sell_confirm_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message is None or context is None:
+    if update.message is None:
         return
 
     pending = _get_pending(context)
@@ -271,14 +276,15 @@ async def sell_confirm_listener(update: Update, context: ContextTypes.DEFAULT_TY
             payload = pending["payload"]
 
             status, body_preview = await asyncio.to_thread(_submit_form, form_url, payload)
+            logger.info("SELL: form submit status=%s preview=%r", status, (body_preview or "")[:200])
 
-            if status >= 200 and status < 300:
+            # Google Forms often returns 200 or 302
+            if 200 <= status < 400:
                 _clear_pending(context)
                 await update.message.reply_text("Операция отправлена.")
                 return
 
-            logger.error("SELL: form submit failed: status=%s preview=%s", status, body_preview)
-            await update.message.reply_text("Не удалось отправить операцию. Попробуйте позже.")
+            await update.message.reply_text("Не удалось отправить операцию (Google Forms). Попробуйте позже.")
             return
 
         except Exception:
