@@ -40,6 +40,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# временные строки для проверки логов
+print("IMPORT: bot.py loaded")
+logger.info("IMPORT: logger works")
 
 # -----------------------------
 # FastAPI app (для платформ, которые ожидают web-процесс)
