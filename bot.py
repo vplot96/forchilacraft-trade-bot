@@ -435,6 +435,11 @@ def root():
 
 def main():
     port = int(os.getenv("PORT", "8000"))
+
+    # временная проверка логов в Timeweb
+    logger.info("BOOT: logging is working")
+    print("BOOT: print works too")
+    
     uvicorn.run("bot:app", host="0.0.0.0", port=port, log_level="info")
 
 
