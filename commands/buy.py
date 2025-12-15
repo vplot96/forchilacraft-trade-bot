@@ -1,14 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-/buy <товар> <количество>
-
-Покупка всегда идёт по самым дешёвым открытым лотам из листа open_lots (CSV export).
-open_lots ожидается в формате колонок (без заголовков тоже ок):
-0 ts, 1 sale_id, 2 seller_user, 3 item_id, 4 item_name, 5 remaining, 6 price
-"""
-
 import asyncio
 import csv
 import logging
@@ -194,18 +186,6 @@ def _clear_pending(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def _load_buy_cfg() -> Optional[dict]:
-    """
-    env:
-      SHEET_ID
-      GID_OPEN_LOTS
-      GID_ACCOUNTS (уже обязателен в bot.py, но тут читаем напрямую)
-      FORM_TRADES_ID
-      FORM_TRADES_ENTRY_SALE_ID
-      FORM_TRADES_ENTRY_USER
-      FORM_TRADES_ENTRY_ITEM_ID_ID
-      FORM_TRADES_ENTRY_AMOUNT
-      FORM_TRADES_ENTRY_PRICE
-    """
     global _cfg
     if _cfg is not None:
         return _cfg
@@ -220,12 +200,13 @@ def _load_buy_cfg() -> Optional[dict]:
         return None
 
     entry_sale_id = os.getenv("FORM_TRADES_ENTRY_SALE_ID") or None
-    entry_user = os.getenv("FORM_TRADES_ENTRY_USER") or None
+    entry_seller = os.getenv("FORM_TRADES_ENTRY_SELLER") or None
+    entry_buyer = os.getenv("FORM_TRADES_ENTRY_BUYER") or None
     entry_item_id = os.getenv("FORM_TRADES_ENTRY_ITEM_ID") or None
     entry_amount = os.getenv("FORM_TRADES_ENTRY_AMOUNT") or None
     entry_price = os.getenv("FORM_TRADES_ENTRY_PRICE") or None
 
-    if not entry_sale_id or not entry_user or not entry_item_id or not entry_amount or not entry_price:
+    if not entry_sale_id or not entry_seller or not entry_buyer or not entry_item_id or not entry_amount or not entry_price:
         _cfg = None
         return None
 
@@ -235,7 +216,8 @@ def _load_buy_cfg() -> Optional[dict]:
         "gid_accounts": gid_accounts,
         "form_url": f"https://docs.google.com/forms/d/e/{form_id}/formResponse",
         "entry_sale_id": f"entry.{entry_sale_id}",
-        "entry_user": f"entry.{entry_user}",
+        "entry_seller": f"entry.{entry_seller}",
+        "entry_buyer": f"entry.{entry_buyer}",
         "entry_item_id": f"entry.{entry_item_id}",
         "entry_amount": f"entry.{entry_amount}",
         "entry_price": f"entry.{entry_price}",
@@ -355,7 +337,13 @@ async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "total_cost": total_cost,
         # список покупок по лотам
         "allocations": [
-            {"sale_id": lot.sale_id, "item_id": lot.item_id, "qty": take, "price": lot.price}
+            {
+                "sale_id": lot.sale_id,
+                "seller": lot.seller_user,
+                "item_id": lot.item_id,
+                "qty": take,
+                "price": lot.price,
+            }
             for (lot, take) in allocations
         ],
     })
@@ -414,6 +402,7 @@ async def buy_confirm_listener(update: Update, context: ContextTypes.DEFAULT_TYP
 
     balance = _get_user_balance(accounts, buyer)
     if balance is None:
+        _clear_pending(context)
         await update.message.reply_text("Не удалось найти ваш счёт в таблице 'Счета'.")
         return
 
@@ -430,7 +419,8 @@ async def buy_confirm_listener(update: Update, context: ContextTypes.DEFAULT_TYP
         for a in allocations:
             payload = {
                 cfg["entry_sale_id"]: str(a["sale_id"]),
-                cfg["entry_user"]: str(buyer),
+                cfg["entry_seller"]: str(a["seller"]),
+                cfg["entry_buyer"]: str(buyer),
                 cfg["entry_item_id"]: str(a["item_id"]),
                 cfg["entry_amount"]: str(int(a["qty"])),
                 cfg["entry_price"]: str(int(a["price"])),
