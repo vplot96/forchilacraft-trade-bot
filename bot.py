@@ -91,6 +91,7 @@ from commands.price import price, price_followup_listener, init_price_helpers
 from commands.pay import pay as pay_cmd, init_pay_helpers
 from commands.ops import ops, init_ops_helpers
 from commands.sell import sell, sell_confirm_listener
+from commands.buy import buy, buy_confirm_listener
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Готов к работе! Введите /help для вывода списка команд.")
@@ -112,6 +113,9 @@ async def _unified_text_listener(update: Update, context: ContextTypes.DEFAULT_T
     if context.user_data.get("pending_sell"):
         await sell_confirm_listener(update, context)
         return
+    if context.user_data.get("pending_buy"):
+        await buy_confirm_listener(update, context)
+        return
     if context.user_data.get("pending_price"):
         await price_followup_listener(update, context)
         return
@@ -129,6 +133,7 @@ def build_telegram_app() -> Application:
     tga.add_handler(CommandHandler("pay", pay_cmd), group=1)
     tga.add_handler(CommandHandler("ops", ops), group=1)
     tga.add_handler(CommandHandler("sell", sell), group=1)
+    tga.add_handler(CommandHandler("buy", buy), group=1)
     tga.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _unified_text_listener), group=2)
     tga.add_error_handler(_on_error)
     return tga
