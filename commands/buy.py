@@ -280,14 +280,15 @@ async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # /buy <товар> <количество>
     args = context.args or []
     if len(args) < 2:
-        await update.message.reply_text('Использование: /buy <товар> <количество>\nПример: /buy алмаз 10')
+        await update.message.reply_text('Использование: /buy <товар> <количество>\nПример: /buy Медный блок 10')
         return
 
     raw_qty = args[-1]
     raw_item = " ".join(args[:-1]).strip()
+
     qty = _parse_int(raw_qty, default=-1)
     if qty <= 0 or not raw_item:
-        await update.message.reply_text('Использование: /buy <товар> <количество>\nПример: /buy алмаз 10')
+        await update.message.reply_text('Использование: /buy <товар> <количество>\nПример: /buy Медный блок 10')
         return
 
     sender = update.effective_user
