@@ -18,6 +18,7 @@ import logging
 from io import StringIO
 from typing import Optional, List, Dict, Tuple
 from decimal import Decimal, ROUND_HALF_UP
+from difflib import SequenceMatcher
 
 import requests
 from telegram import Update
@@ -80,35 +81,31 @@ def _fetch_rows(sheet_id: str, gid: str) -> List[Dict[str, str]]:
     reader = csv.DictReader(StringIO(txt))
     return list(reader)
 
-
-def _best_match_product(rows: List[Dict[str, str]], query: str) -> Optional[str]:
+# Поиск строки в таблице товаров
+def _find_product_by_name(rows, query):
     q = _normalize(query)
     if not q:
         return None
 
-    # Typical column names in your sheet (RU) + a few fallbacks
-    name_cols = ["Название товара", "Название в игре", "Название", "Товар", "Name"]
+    best_row = None
+    best_ratio = 0.0
 
-    def get_name(row: Dict[str, str]) -> str:
-        for c in name_cols:
-            v = str(row.get(c) or "").strip()
-            if v:
-                return v
-        return ""
-
-    # 1) exact match
     for row in rows:
-        name = get_name(row)
-        if name and _normalize(name) == q:
-            return name
+        name = str(row.get("Название", "")).strip()
+        if not name:
+            continue
 
-    # 2) contains match (first hit)
-    for row in rows:
-        name = get_name(row)
-        if name and q in _normalize(name):
-            return name
+        n = _normalize(name)
 
-    return None
+        if n == q:
+            return row
+
+        ratio = SequenceMatcher(None, q, n).ratio()
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_row = row
+
+    return best_row
 
 
 def _load_sell_cfg() -> Optional[dict]:
@@ -228,35 +225,33 @@ async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     sender_username = f"@{sender_u}"
 
-    # Quick ACK so you see bot is alive even if Google is slow
-    await update.message.reply_text("Проверяю товар в таблице...")
-
     try:
         rows = await asyncio.to_thread(_fetch_rows, sheet_id, gid_prices)
         logger.info("SELL: fetched %s products", len(rows))
     except Exception:
         logger.exception("SELL: failed to fetch products from sheet")
-        await update.message.reply_text("Не удалось получить список товаров (Google Sheets). Попробуйте позже.")
+        await update.message.reply_text("Не удалось получить список товаров. Попробуйте позже.")
         return
 
-    matched_name = _best_match_product(rows, raw_item)
-    if not matched_name:
+    product = _find_product_by_name(rows, raw_item)
+    if not product:
         await update.message.reply_text(f'Не нашёл товар по запросу: "{raw_item}". Проверьте название.')
         return
+        
+    product_name = str(product["Название"]).strip()
 
-    op_id = str(uuid.uuid4())
     payload = {
-        cfg["entry_op_id"]: op_id,
+        cfg["entry_op_id"]: str(uuid.uuid4()),
         cfg["entry_user"]: sender_username,
         cfg["entry_type"]: "Продажа",
-        cfg["entry_item"]: matched_name,
+        cfg["entry_item"]: str(product["Id товара"]).strip(),
         cfg["entry_qty"]: str(qty),
         cfg["entry_price"]: _fmt_money_form(price),
     }
     _set_pending(context, {"form_url": cfg["post_url"], "payload": payload})
 
     await update.message.reply_text(
-        f'Вы собираетесь продать {matched_name} в количестве {qty} по {_fmt_money_human(price)}?\n'
+        f'Вы собираетесь продать {product_name} в количестве {qty} по {_fmt_money_human(price)}?\n'
         'Ответьте "да" или "нет".'
     )
 
@@ -278,11 +273,9 @@ async def sell_confirm_listener(update: Update, context: ContextTypes.DEFAULT_TY
 
             # Вреенные логи
             logger.info("SELL: posting to form_url=%s", form_url)
-            await update.message.reply_text(f"DEBUG: form_url={form_url}")
 
             status, body_preview = await asyncio.to_thread(_submit_form, form_url, payload)
             logger.info("SELL: form submit status=%s preview=%r", status, (body_preview or "")[:200])
-            await update.message.reply_text(f"DEBUG: status={status}\n{(body_preview or '')[:200]}")
 
             # Google Forms often returns 200 or 302
             if 200 <= status < 400:
@@ -290,7 +283,7 @@ async def sell_confirm_listener(update: Update, context: ContextTypes.DEFAULT_TY
                 await update.message.reply_text("Операция отправлена.")
                 return
 
-            await update.message.reply_text("Не удалось отправить операцию (Google Forms). Попробуйте позже.")
+            await update.message.reply_text("Не удалось отправить операцию. Попробуйте позже.")
             return
 
         except Exception:
