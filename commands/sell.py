@@ -77,7 +77,7 @@ def _fetch_rows(sheet_id: str, gid: str) -> List[Dict[str, str]]:
     r = requests.get(url, timeout=25)
     r.raise_for_status()
 
-    txt = r.text or ""
+    txt = (r.content or b"").decode("utf-8-sig")
     reader = csv.DictReader(StringIO(txt))
     return list(reader)
 
