@@ -175,9 +175,9 @@ async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     sheet_id = _optional_env("SHEET_ID")
-    gid_prices = _optional_env("GID_PRICES")
-    if not sheet_id or not gid_prices:
-        await update.message.reply_text("Команда /sell недоступна: не настроены переменные таблицы товаров (SHEET_ID/GID_PRICES).")
+    gid_items = _optional_env("GID_ITEMS")
+    if not sheet_id or not gid_items:
+        await update.message.reply_text("Команда /sell недоступна: не настроены переменные таблицы товаров (SHEET_ID/GID_ITEMS).")
         return
 
     if not context.args or len(context.args) < 3:
@@ -215,7 +215,7 @@ async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sender_username = f"@{sender_u}"
 
     try:
-        rows = await asyncio.to_thread(_fetch_rows, sheet_id, gid_prices)
+        rows = await asyncio.to_thread(_fetch_rows, sheet_id, gid_items)
         logger.info("SELL: fetched %s products", len(rows))
     except Exception:
         logger.exception("SELL: failed to fetch products from sheet")
