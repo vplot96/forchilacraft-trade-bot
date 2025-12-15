@@ -1,14 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""/sell command for Forchilacraft Trade Bot.
-
-Fixes included:
-- Never blocks the asyncio event loop: all requests (Google Sheets + Google Forms) run via asyncio.to_thread.
-- Stable pending structure (form_url + payload) that matches the confirm listener.
-- Proper logger so exceptions are visible in hosting logs.
-"""
-
 import os
 import re
 import csv
@@ -68,17 +60,14 @@ def _fmt_money_human(v: Decimal) -> str:
     return s.rstrip("0").rstrip(".") if "." in s else s
 
 
-def _csv_url(sheet_id: str, gid: str) -> str:
-    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
-
-
 def _fetch_rows(sheet_id: str, gid: str) -> List[Dict[str, str]]:
-    url = _csv_url(sheet_id, gid)
+    url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
     r = requests.get(url, timeout=25)
     r.raise_for_status()
 
     txt = (r.content or b"").decode("utf-8-sig")
     reader = csv.DictReader(StringIO(txt))
+    logger.info("SELL CSV headers: %r", reader.fieldnames)
     return list(reader)
 
 # Поиск строки в таблице товаров
