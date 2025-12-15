@@ -22,11 +22,6 @@ _PENDING_KEY = "pending_sell"
 _cfg: Optional[dict] = None
 
 
-def _optional_env(name: str) -> Optional[str]:
-    v = os.getenv(name)
-    return v if v else None
-
-
 def _normalize(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip()).lower()
 
@@ -103,17 +98,17 @@ def _load_sell_cfg() -> Optional[dict]:
     if _cfg is not None:
         return _cfg
 
-    form_id = _optional_env("FORM_OPS_ID")
+    form_id = os.getenv("FORM_OPS_ID") or None
     if not form_id:
         _cfg = None
         return None
 
-    entry_op_id = _optional_env("FORM_OPS_ENTRY_OP_ID")
-    entry_user = _optional_env("FORM_OPS_ENTRY_USER")
-    entry_type = _optional_env("FORM_OPS_ENTRY_TYPE")
-    entry_item = _optional_env("FORM_OPS_ENTRY_ITEM")
-    entry_qty = _optional_env("FORM_OPS_ENTRY_QTY")
-    entry_price = _optional_env("FORM_OPS_ENTRY_PRICE")
+    entry_op_id = os.getenv("FORM_OPS_ENTRY_OP_ID") or None
+    entry_user = os.getenv("FORM_OPS_ENTRY_USER") or None
+    entry_type = os.getenv("FORM_OPS_ENTRY_TYPE") or None
+    entry_item = os.getenv("FORM_OPS_ENTRY_ITEM") or None
+    entry_qty = os.getenv("FORM_OPS_ENTRY_QTY") or None
+    entry_price = os.getenv("FORM_OPS_ENTRY_PRICE") or None
 
     if not all([entry_op_id, entry_user, entry_type, entry_item, entry_qty, entry_price]):
         _cfg = None
@@ -174,8 +169,8 @@ async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Команда /sell недоступна: не настроены переменные Google Forms.")
         return
 
-    sheet_id = _optional_env("SHEET_ID")
-    gid_items = _optional_env("GID_ITEMS")
+    sheet_id = os.getenv("SHEET_ID") or None
+    gid_items = os.getenv("GID_ITEMS") or None
     if not sheet_id or not gid_items:
         await update.message.reply_text("Команда /sell недоступна: не настроены переменные таблицы товаров (SHEET_ID/GID_ITEMS).")
         return
