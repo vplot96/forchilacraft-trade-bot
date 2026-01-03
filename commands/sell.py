@@ -93,35 +93,33 @@ def _find_product_by_name(rows, query):
 
 
 def _load_sell_cfg() -> Optional[dict]:
-    """Loads Google Form configuration from env vars once."""
+    """Loads Google Form configuration for SELL from env vars once."""
     global _cfg
     if _cfg is not None:
         return _cfg
 
-    form_id = os.getenv("FORM_OPS_ID") or None
+    form_id = os.getenv("FORM_SELL_ID") or None
     if not form_id:
         _cfg = None
         return None
 
-    entry_op_id = os.getenv("FORM_OPS_ENTRY_OP_ID") or None
-    entry_user = os.getenv("FORM_OPS_ENTRY_USER") or None
-    entry_type = os.getenv("FORM_OPS_ENTRY_TYPE") or None
-    entry_item = os.getenv("FORM_OPS_ENTRY_ITEM") or None
-    entry_qty = os.getenv("FORM_OPS_ENTRY_QTY") or None
-    entry_price = os.getenv("FORM_OPS_ENTRY_PRICE") or None
+    entry_sale_id = os.getenv("FORM_SELL_ENTRY_SALE_ID") or None
+    entry_seller = os.getenv("FORM_SELL_ENTRY_SELLER") or None
+    entry_item_id = os.getenv("FORM_SELL_ENTRY_ITEM_ID") or None
+    entry_amount = os.getenv("FORM_SELL_ENTRY_AMOUNT") or None
+    entry_price = os.getenv("FORM_SELL_ENTRY_PRICE") or None
 
-    if not all([entry_op_id, entry_user, entry_type, entry_item, entry_qty, entry_price]):
+    if not all([entry_sale_id, entry_seller, entry_item_id, entry_amount, entry_price]):
         _cfg = None
         return None
 
     _cfg = {
         "form_id": form_id,
         "post_url": f"https://docs.google.com/forms/d/e/{form_id}/formResponse",
-        "entry_op_id": f"entry.{entry_op_id}",
-        "entry_user": f"entry.{entry_user}",
-        "entry_type": f"entry.{entry_type}",
-        "entry_item": f"entry.{entry_item}",
-        "entry_qty": f"entry.{entry_qty}",
+        "entry_sale_id": f"entry.{entry_sale_id}",
+        "entry_seller": f"entry.{entry_seller}",
+        "entry_item_id": f"entry.{entry_item_id}",
+        "entry_amount": f"entry.{entry_amount}",
         "entry_price": f"entry.{entry_price}",
     }
     return _cfg
@@ -225,11 +223,10 @@ async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
     product_name = str(product["Название"]).strip()
 
     payload = {
-        cfg["entry_op_id"]: str(uuid.uuid4()),
-        cfg["entry_user"]: sender_username,
-        cfg["entry_type"]: "Продажа",
-        cfg["entry_item"]: str(product["Id товара"]).strip(),
-        cfg["entry_qty"]: str(qty),
+        cfg["entry_sale_id"]: str(uuid.uuid4()),
+        cfg["entry_seller"]: sender_username,
+        cfg["entry_item_id"]: str(product["Id товара"]).strip(),
+        cfg["entry_amount"]: str(qty),
         cfg["entry_price"]: _fmt_money_form(price),
     }
     _set_pending(context, {"form_url": cfg["post_url"], "payload": payload})
