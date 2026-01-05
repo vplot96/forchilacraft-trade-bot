@@ -194,19 +194,27 @@ def _load_buy_cfg() -> Optional[dict]:
     gid_open_lots = os.getenv("GID_OPEN_LOTS") or None
     gid_accounts = os.getenv("GID_ACCOUNTS") or None
 
-    form_id = os.getenv("FORM_TRADES_ID") or None
-    if not sheet_id or not gid_open_lots or not gid_accounts or not form_id:
-        _cfg = None
-        return None
+    form_id = os.getenv("FORM_BUY_ID") or None
 
-    entry_sale_id = os.getenv("FORM_TRADES_ENTRY_SALE_ID") or None
-    entry_seller = os.getenv("FORM_TRADES_ENTRY_SELLER") or None
-    entry_buyer = os.getenv("FORM_TRADES_ENTRY_BUYER") or None
-    entry_item_id = os.getenv("FORM_TRADES_ENTRY_ITEM_ID") or None
-    entry_amount = os.getenv("FORM_TRADES_ENTRY_AMOUNT") or None
-    entry_price = os.getenv("FORM_TRADES_ENTRY_PRICE") or None
+    entry_sale_id = os.getenv("FORM_BUY_ENTRY_SALE_ID") or None
+    entry_seller = os.getenv("FORM_BUY_ENTRY_SELLER") or None
+    entry_buyer = os.getenv("FORM_BUY_ENTRY_BUYER") or None
+    entry_item_id = os.getenv("FORM_BUY_ENTRY_ITEM_ID") or None
+    entry_amount = os.getenv("FORM_BUY_ENTRY_AMOUNT") or None
+    entry_price = os.getenv("FORM_BUY_ENTRY_PRICE") or None
 
-    if not entry_sale_id or not entry_seller or not entry_buyer or not entry_item_id or not entry_amount or not entry_price:
+    if not all([
+        sheet_id,
+        gid_open_lots,
+        gid_accounts,
+        form_id,
+        entry_sale_id,
+        entry_seller,
+        entry_buyer,
+        entry_item_id,
+        entry_amount,
+        entry_price,
+    ]):
         _cfg = None
         return None
 
@@ -226,11 +234,6 @@ def _load_buy_cfg() -> Optional[dict]:
 
 
 def _fetch_accounts(sheet_id: str, gid_accounts: str) -> List[dict]:
-    """
-    Ожидаем, что на листе Счета есть заголовки, включая:
-      - Пользователь
-      - Баланс
-    """
     txt = _fetch_csv_text(sheet_id, gid_accounts)
     reader = csv.DictReader(StringIO(txt))
     return list(reader)
@@ -241,7 +244,6 @@ def _get_user_balance(accounts: List[dict], username: str) -> Optional[int]:
     if not u:
         return None
 
-    # строгие названия колонок (как ты и хотел)
     user_col = "Пользователь"
     balance_col = "Баланс"
 
