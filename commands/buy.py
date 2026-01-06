@@ -8,7 +8,7 @@ import os
 import re
 from dataclasses import dataclass
 from io import StringIO
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import requests
 from telegram import Update
@@ -194,32 +194,39 @@ def _load_buy_cfg() -> Optional[dict]:
     gid_open_lots = os.getenv("GID_OPEN_LOTS") or None
     gid_accounts = os.getenv("GID_ACCOUNTS") or None
 
-    form_id = os.getenv("FORM_BUY_ID") or None
-    if not sheet_id or not gid_open_lots or not gid_accounts or not form_id:
-        _cfg = None
-        return None
+    buy_form_id = os.getenv("FORM_BUY_ID") or None
+    buy_entry_sale_id = os.getenv("FORM_BUY_ENTRY_SALE_ID") or None
+    buy_entry_seller = os.getenv("FORM_BUY_ENTRY_SELLER") or None
+    buy_entry_buyer = os.getenv("FORM_BUY_ENTRY_BUYER") or None
+    buy_entry_item_id = os.getenv("FORM_BUY_ENTRY_ITEM_ID") or None
+    buy_entry_amount = os.getenv("FORM_BUY_ENTRY_AMOUNT") or None
+    buy_entry_price = os.getenv("FORM_BUY_ENTRY_PRICE") or None
 
-    entry_sale_id = os.getenv("FORM_BUY_ENTRY_SALE_ID") or None
-    entry_seller = os.getenv("FORM_BUY_ENTRY_SELLER") or None
-    entry_buyer = os.getenv("FORM_BUY_ENTRY_BUYER") or None
-    entry_item_id = os.getenv("FORM_BUY_ENTRY_ITEM_ID") or None
-    entry_amount = os.getenv("FORM_BUY_ENTRY_AMOUNT") or None
-    entry_price = os.getenv("FORM_BUY_ENTRY_PRICE") or None
-
-    if not entry_sale_id or not entry_seller or not entry_buyer or not entry_item_id or not entry_amount or not entry_price:
-        _cfg = None
-        return None
-
-
-    # --- FORM_PAY (переводы) ---
-    pay_form_id = os.getenv("FORM_PAY") or None
+    pay_form_id = os.getenv("FORM_PAY_ID") or None
     pay_entry_sender = os.getenv("FORM_PAY_ENTRY_SENDER") or None
     pay_entry_sender_comment = os.getenv("FORM_PAY_ENTRY_SENDER_COMMENT") or None
     pay_entry_recipient = os.getenv("FORM_PAY_ENTRY_RECIPIENT") or None
     pay_entry_recipient_comment = os.getenv("FORM_PAY_ENTRY_RECIPIENT_COMMENT") or None
     pay_entry_sum = os.getenv("FORM_PAY_ENTRY_SUM") or None
 
-    if not pay_form_id or not pay_entry_sender or not pay_entry_sender_comment or not pay_entry_recipient or not pay_entry_recipient_comment or not pay_entry_sum:
+    if not all([
+        sheet_id,
+        gid_open_lots,
+        gid_accounts,
+        buy_form_id,
+        buy_entry_sale_id,
+        buy_entry_seller,
+        buy_entry_buyer,
+        buy_entry_item_id,
+        buy_entry_amount,
+        buy_entry_price,
+        pay_form_id,
+        pay_entry_sender,
+        pay_entry_sender_comment,
+        pay_entry_recipient,
+        pay_entry_recipient_comment,
+        pay_entry_sum
+    ]):
         _cfg = None
         return None
 
@@ -227,13 +234,13 @@ def _load_buy_cfg() -> Optional[dict]:
         "sheet_id": sheet_id,
         "gid_open_lots": gid_open_lots,
         "gid_accounts": gid_accounts,
-        "form_url": f"https://docs.google.com/forms/d/e/{form_id}/formResponse",
-        "entry_sale_id": f"entry.{entry_sale_id}",
-        "entry_seller": f"entry.{entry_seller}",
-        "entry_buyer": f"entry.{entry_buyer}",
-        "entry_item_id": f"entry.{entry_item_id}",
-        "entry_amount": f"entry.{entry_amount}",
-        "entry_price": f"entry.{entry_price}",
+        "buy_form_url": f"https://docs.google.com/forms/d/e/{buy_form_id}/formResponse",
+        "buy_entry_sale_id": f"entry.{buy_entry_sale_id}",
+        "buy_entry_seller": f"entry.{buy_entry_seller}",
+        "buy_entry_buyer": f"entry.{buy_entry_buyer}",
+        "buy_entry_item_id": f"entry.{buy_entry_item_id}",
+        "buy_entry_amount": f"entry.{buy_entry_amount}",
+        "buy_entry_price": f"entry.{buy_entry_price}",
         "pay_form_url": f"https://docs.google.com/forms/d/e/{pay_form_id}/formResponse",
         "pay_entry_sender": f"entry.{pay_entry_sender}",
         "pay_entry_sender_comment": f"entry.{pay_entry_sender_comment}",
@@ -431,20 +438,20 @@ async def buy_confirm_listener(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     # 3) отправляем покупки в Google Form (может быть несколько строк, если покупка из разных лотов)
-    form_url = cfg["form_url"]
+    buy_form_url = cfg["buy_form_url"]
     allocations = pending["allocations"]
 
     try:
         for a in allocations:
             payload = {
-                cfg["entry_sale_id"]: str(a["sale_id"]),
-                cfg["entry_seller"]: str(a["seller"]),
-                cfg["entry_buyer"]: str(buyer),
-                cfg["entry_item_id"]: str(a["item_id"]),
-                cfg["entry_amount"]: str(int(a["qty"])),
-                cfg["entry_price"]: str(int(a["price"])),
+                cfg["buy_entry_sale_id"]: str(a["sale_id"]),
+                cfg["buy_entry_seller"]: str(a["seller"]),
+                cfg["buy_entry_buyer"]: str(buyer),
+                cfg["buy_entry_item_id"]: str(a["item_id"]),
+                cfg["buy_entry_amount"]: str(int(a["qty"])),
+                cfg["buy_entry_price"]: str(int(a["price"])),
             }
-            status, preview = await asyncio.to_thread(_submit_trade, form_url, payload)
+            status, preview = await asyncio.to_thread(_submit_trade, buy_form_url, payload)
             logger.info("BUY: submit status=%s preview=%r", status, preview)
             if not (200 <= status < 400):
                 await update.message.reply_text("Не удалось отправить покупку (Google Forms). Попробуйте позже.")
@@ -485,5 +492,5 @@ async def buy_confirm_listener(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("Не удалось отправить переводы (Google Forms). Попробуйте позже.")
         return
 
-_clear_pending(context)
+    _clear_pending(context)
     await update.message.reply_text("Покупка отправлена.")
