@@ -52,11 +52,19 @@ def _fetch_csv_text(sheet_id: str, gid: str) -> str:
     return (r.content or b"").decode("utf-8-sig", errors="replace")
 
 
+def _tg_nick(update: Update) -> str:
+    # Ник для сопоставления с колонкой 'Ник' на листе 'Счета'.
+    u = update.effective_user
+    if u and u.username:
+        return f"@{u.username}"
+    return (u.full_name if u else "unknown").strip()
+
+
 @dataclass(frozen=True)
 class OpenLot:
     ts: str
     sale_id: str
-    seller_user: str
+    seller_user: str  # ожидается 'Ник' продавца из 'Счета'
     item_id: str
     item_name: str
     remaining: int
@@ -64,11 +72,7 @@ class OpenLot:
 
 
 def _parse_open_lots(csv_text: str) -> List[OpenLot]:
-    """
-    Парсим open_lots без зависимости от заголовков:
-    - если есть заголовки, пропустим строку по эвристике (sale_id == 'Id операции' и т.п.)
-    - если заголовков нет, первая строка будет данными — ок
-    """
+    # Парсим open_lots без зависимости от заголовков.
     rows: List[List[str]] = []
     reader = csv.reader(StringIO(csv_text))
     for r in reader:
@@ -78,12 +82,13 @@ def _parse_open_lots(csv_text: str) -> List[OpenLot]:
 
     lots: List[OpenLot] = []
     for r in rows:
-        # минимально 7 колонок
         if len(r) < 7:
             continue
 
-        # эвристика для хедера
-        maybe_header = _normalize(r[1]) in {"id операции", "id", "sale_id", "id продажи"} or _normalize(r[3]) in {"id товара", "item_id"}
+        maybe_header = _normalize(r[1]) in {"id операции", "id", "sale_id", "id продажи"} or _normalize(r[3]) in {
+            "id товара",
+            "item_id",
+        }
         if maybe_header:
             continue
 
@@ -108,26 +113,19 @@ def _parse_open_lots(csv_text: str) -> List[OpenLot]:
 
 
 def _resolve_item_from_lots(lots: List[OpenLot], raw_query: str) -> Optional[Tuple[str, str]]:
-    """
-    Выбираем ОДИН товар (item_id + item_name) по пользовательскому вводу.
-    Дальше покупаем только лоты с этим item_id.
-    """
     q = _normalize(raw_query)
     if not q:
         return None
 
-    # уникальные варианты товаров из open_lots
-    seen = {}
+    seen: Dict[str, str] = {}
     for l in lots:
         if l.item_id and l.item_name:
             seen[l.item_id] = l.item_name
 
-    # 1) точное совпадение по названию
     for item_id, name in seen.items():
         if _normalize(name) == q:
             return item_id, name
 
-    # 2) "похожесть" (SequenceMatcher) — без score наружу
     from difflib import SequenceMatcher
 
     best_id = None
@@ -146,11 +144,6 @@ def _resolve_item_from_lots(lots: List[OpenLot], raw_query: str) -> Optional[Tup
 
 
 def _split_buy_across_lots(lots: List[OpenLot], need_qty: int) -> Tuple[List[Tuple[OpenLot, int]], int]:
-    """
-    Выбираем самые дешёвые лоты и распределяем покупку.
-    Возвращает список (лот, qty_из_лота) и итоговую стоимость.
-    """
-    # цена ↑, затем время ↑ (чтобы при одинаковой цене покупать более ранние)
     sorted_lots = sorted(lots, key=lambda l: (l.price, l.ts))
     allocations: List[Tuple[OpenLot, int]] = []
     left = need_qty
@@ -209,24 +202,26 @@ def _load_buy_cfg() -> Optional[dict]:
     pay_entry_recipient_comment = os.getenv("FORM_PAY_ENTRY_RECIPIENT_COMMENT") or None
     pay_entry_sum = os.getenv("FORM_PAY_ENTRY_SUM") or None
 
-    if not all([
-        sheet_id,
-        gid_open_lots,
-        gid_accounts,
-        buy_form_id,
-        buy_entry_sale_id,
-        buy_entry_seller,
-        buy_entry_buyer,
-        buy_entry_item_id,
-        buy_entry_amount,
-        buy_entry_price,
-        pay_form_id,
-        pay_entry_sender,
-        pay_entry_sender_comment,
-        pay_entry_recipient,
-        pay_entry_recipient_comment,
-        pay_entry_sum
-    ]):
+    if not all(
+        [
+            sheet_id,
+            gid_open_lots,
+            gid_accounts,
+            buy_form_id,
+            buy_entry_sale_id,
+            buy_entry_seller,
+            buy_entry_buyer,
+            buy_entry_item_id,
+            buy_entry_amount,
+            buy_entry_price,
+            pay_form_id,
+            pay_entry_sender,
+            pay_entry_sender_comment,
+            pay_entry_recipient,
+            pay_entry_recipient_comment,
+            pay_entry_sum,
+        ]
+    ):
         _cfg = None
         return None
 
@@ -250,37 +245,34 @@ def _load_buy_cfg() -> Optional[dict]:
     }
     return _cfg
 
+
 def _fetch_accounts(sheet_id: str, gid_accounts: str) -> List[dict]:
-    """
-    Ожидаем, что на листе Счета есть заголовки, включая:
-      - Пользователь
-      - Баланс
-    """
+    # Ожидаем заголовки: 'Ник', 'Имя пользователя', 'Баланс'.
     txt = _fetch_csv_text(sheet_id, gid_accounts)
     reader = csv.DictReader(StringIO(txt))
     return list(reader)
 
 
-def _get_user_balance(accounts: List[dict], username: str) -> Optional[int]:
-    u = (username or "").strip()
-    if not u:
+def _find_account_by_nick(accounts: List[dict], nick: str) -> Optional[dict]:
+    n = (nick or "").strip()
+    if not n:
         return None
-
-    # строгие названия колонок (как ты и хотел)
-    user_col = "Пользователь"
-    balance_col = "Баланс"
-
     for row in accounts:
-        if str(row.get(user_col, "")).strip() == u:
-            return _parse_money(row.get(balance_col, "0"))
+        if str(row.get("Ник", "")).strip() == n:
+            return row
     return None
 
 
+def _get_balance_and_game_username(accounts: List[dict], nick: str) -> Optional[Tuple[int, str]]:
+    row = _find_account_by_nick(accounts, nick)
+    if not row:
+        return None
+    balance = _parse_money(row.get("Баланс", "0"))
+    game_username = str(row.get("Имя пользователя", "")).strip()
+    return balance, game_username
+
+
 def _submit_trade(form_url: str, payload: dict) -> Tuple[int, str]:
-    """
-    POST в Google Forms. Обычно 200 или 302.
-    Возвращаем status и первые символы body (для дебага в логах).
-    """
     r = requests.post(form_url, data=payload, timeout=25, allow_redirects=False)
     body_preview = ""
     try:
@@ -302,7 +294,6 @@ async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Команда /buy недоступна: не настроены переменные окружения.")
         return
 
-    # /buy <товар> <количество>
     args = context.args or []
     if len(args) < 2:
         await update.message.reply_text('Использование: /buy <товар> <количество>\nПример: /buy Медный блок 10')
@@ -316,12 +307,10 @@ async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text('Использование: /buy <товар> <количество>\nПример: /buy Медный блок 10')
         return
 
-    sender = update.effective_user
-    sender_username = f"@{sender.username}" if sender and sender.username else (sender.full_name if sender else "unknown")
+    buyer_nick = _tg_nick(update)
 
     await update.message.reply_text("Ищу открытые лоты...")
 
-    # 1) читаем open_lots
     try:
         csv_text = await asyncio.to_thread(_fetch_csv_text, cfg["sheet_id"], cfg["gid_open_lots"])
         all_lots = _parse_open_lots(csv_text)
@@ -355,24 +344,26 @@ async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f'Нет доступных лотов для: "{item_name}".')
         return
 
-    _set_pending(context, {
-        "buyer": sender_username,
-        "item_id": item_id,
-        "item_name": item_name,
-        "qty": qty,
-        "total_cost": total_cost,
-        # список покупок по лотам
-        "allocations": [
-            {
-                "sale_id": lot.sale_id,
-                "seller": lot.seller_user,
-                "item_id": lot.item_id,
-                "qty": take,
-                "price": lot.price,
-            }
-            for (lot, take) in allocations
-        ],
-    })
+    _set_pending(
+        context,
+        {
+            "buyer_nick": buyer_nick,
+            "item_id": item_id,
+            "item_name": item_name,
+            "qty": qty,
+            "total_cost": total_cost,
+            "allocations": [
+                {
+                    "sale_id": lot.sale_id,
+                    "seller_nick": lot.seller_user,
+                    "item_id": lot.item_id,
+                    "qty": take,
+                    "price": lot.price,
+                }
+                for (lot, take) in allocations
+            ],
+        },
+    )
 
     await update.message.reply_text(
         f'Покупка {item_name} ({qty}) будет стоить {_fmt_money_human(total_cost)} джк.\n'
@@ -415,10 +406,10 @@ async def buy_confirm_listener(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("Команда /buy недоступна: не настроены переменные окружения.")
         return
 
-    buyer = pending["buyer"]
+    buyer_nick = str(pending.get("buyer_nick", "")).strip()
     total_cost = int(pending["total_cost"])
+    allocations = pending["allocations"]
 
-    # 2) проверяем баланс
     try:
         accounts = await asyncio.to_thread(_fetch_accounts, cfg["sheet_id"], cfg["gid_accounts"])
     except Exception:
@@ -426,10 +417,19 @@ async def buy_confirm_listener(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("Не удалось проверить баланс. Попробуйте позже.")
         return
 
-    balance = _get_user_balance(accounts, buyer)
-    if balance is None:
+    buyer_info = _get_balance_and_game_username(accounts, buyer_nick)
+    if buyer_info is None:
         _clear_pending(context)
-        await update.message.reply_text("Не удалось найти ваш счёт в таблице 'Счета'.")
+        await update.message.reply_text(
+            "Не удалось найти ваш ник в таблице 'Счета'.\n"
+            f"Ожидался ник: {buyer_nick}"
+        )
+        return
+
+    balance, buyer_game = buyer_info
+    if not buyer_game:
+        _clear_pending(context)
+        await update.message.reply_text("В таблице 'Счета' у вашего ника не заполнено поле 'Имя пользователя'.")
         return
 
     if balance < total_cost:
@@ -437,58 +437,87 @@ async def buy_confirm_listener(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(f"Недостаточно средств. Нужно {total_cost} джк, у вас {balance} джк.")
         return
 
-    # 3) отправляем покупки в Google Form (может быть несколько строк, если покупка из разных лотов)
-    buy_form_url = cfg["buy_form_url"]
-    allocations = pending["allocations"]
+    seller_game_by_nick: Dict[str, str] = {}
+    for a in allocations:
+        s_nick = str(a.get("seller_nick", "")).strip()
+        if not s_nick:
+            continue
+        if s_nick in seller_game_by_nick:
+            continue
 
+        info = _get_balance_and_game_username(accounts, s_nick)
+        if info is None:
+            _clear_pending(context)
+            await update.message.reply_text(
+                "Не удалось найти продавца в таблице 'Счета'.\n"
+                f"Ник продавца: {s_nick}"
+            )
+            return
+        _, s_game = info
+        if not s_game:
+            _clear_pending(context)
+            await update.message.reply_text(
+                "В таблице 'Счета' у продавца не заполнено поле 'Имя пользователя'.\n"
+                f"Ник продавца: {s_nick}"
+            )
+            return
+        seller_game_by_nick[s_nick] = s_game
+
+    buy_form_url = cfg["buy_form_url"]
     try:
         for a in allocations:
+            s_nick = str(a.get("seller_nick", "")).strip()
+            seller_game = seller_game_by_nick.get(s_nick, s_nick)
+
             payload = {
                 cfg["buy_entry_sale_id"]: str(a["sale_id"]),
-                cfg["buy_entry_seller"]: str(a["seller"]),
-                cfg["buy_entry_buyer"]: str(buyer),
+                cfg["buy_entry_seller"]: str(seller_game),
+                cfg["buy_entry_buyer"]: str(buyer_game),
                 cfg["buy_entry_item_id"]: str(a["item_id"]),
                 cfg["buy_entry_amount"]: str(int(a["qty"])),
                 cfg["buy_entry_price"]: str(int(a["price"])),
             }
             status, preview = await asyncio.to_thread(_submit_trade, buy_form_url, payload)
-            logger.info("BUY: submit status=%s preview=%r", status, preview)
+            logger.info("BUY: submit(BUY) status=%s preview=%r", status, preview)
             if not (200 <= status < 400):
                 await update.message.reply_text("Не удалось отправить покупку (Google Forms). Попробуйте позже.")
                 return
     except Exception:
-        logger.exception("BUY: form submit failed")
+        logger.exception("BUY: BUY form submit failed")
         await update.message.reply_text("Не удалось отправить покупку (Google Forms). Попробуйте позже.")
         return
 
-    
-
-    # 4) отправляем переводы (FORM_PAY) — по одному на каждого продавца
     pay_form_url = cfg["pay_form_url"]
-    item_name = pending.get("item_name", "")
-    seller_totals = {}
+    item_name = str(pending.get("item_name", "")).strip()
+
+    seller_totals: Dict[str, int] = {}
     for a in allocations:
-        seller = str(a.get("seller", "")).strip()
-        if not seller:
-            continue
-        seller_totals[seller] = seller_totals.get(seller, 0) + int(a.get("qty", 0)) * int(a.get("price", 0))
+        s_nick = str(a.get("seller_nick", "")).strip()
+        s_game = seller_game_by_nick.get(s_nick, s_nick)
+        seller_totals[s_game] = seller_totals.get(s_game, 0) + int(a.get("qty", 0)) * int(a.get("price", 0))
 
     try:
-        for seller, seller_sum in seller_totals.items():
+        for seller_game, seller_sum in seller_totals.items():
             payload = {
-                cfg["pay_entry_sender"]: str(buyer),
+                cfg["pay_entry_sender"]: str(buyer_game),
                 cfg["pay_entry_sender_comment"]: f"Покупка: {item_name} ({seller_sum} джк)",
-                cfg["pay_entry_recipient"]: str(seller),
+                cfg["pay_entry_recipient"]: str(seller_game),
                 cfg["pay_entry_recipient_comment"]: f"Продажа: {item_name} ({seller_sum} джк)",
                 cfg["pay_entry_sum"]: str(int(seller_sum)),
             }
             status, preview = await asyncio.to_thread(_submit_trade, pay_form_url, payload)
-            logger.info("BUY: pay submit status=%s preview=%r seller=%s sum=%s", status, preview, seller, seller_sum)
+            logger.info(
+                "BUY: submit(PAY) status=%s preview=%r recipient=%s sum=%s",
+                status,
+                preview,
+                seller_game,
+                seller_sum,
+            )
             if not (200 <= status < 400):
                 await update.message.reply_text("Не удалось отправить переводы (Google Forms). Попробуйте позже.")
                 return
     except Exception:
-        logger.exception("BUY: pay form submit failed")
+        logger.exception("BUY: PAY form submit failed")
         await update.message.reply_text("Не удалось отправить переводы (Google Forms). Попробуйте позже.")
         return
 
