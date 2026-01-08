@@ -22,6 +22,9 @@ _PENDING_KEY = "pending_sell"
 _cfg: Optional[dict] = None
 
 
+# -----------------------------
+# helpers
+# -----------------------------
 def _normalize(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip()).lower()
 
@@ -55,17 +58,56 @@ def _fmt_money_human(v: Decimal) -> str:
     return s.rstrip("0").rstrip(".") if "." in s else s
 
 
-def _fetch_rows(sheet_id: str, gid: str) -> List[Dict[str, str]]:
-    url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
+def _csv_export_url(sheet_id: str, gid: str) -> str:
+    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
+
+
+def _fetch_csv_text(sheet_id: str, gid: str) -> str:
+    url = _csv_export_url(sheet_id, gid)
     r = requests.get(url, timeout=25)
     r.raise_for_status()
+    # utf-8-sig removes BOM if present
+    return (r.content or b"").decode("utf-8-sig", errors="replace")
 
-    txt = (r.content or b"").decode("utf-8-sig")
+
+def _fetch_rows(sheet_id: str, gid: str) -> List[Dict[str, str]]:
+    txt = _fetch_csv_text(sheet_id, gid)
     reader = csv.DictReader(StringIO(txt))
-    logger.info("SELL CSV headers: %r", reader.fieldnames)
+    logger.info("SELL CSV headers(gid=%s): %r", gid, reader.fieldnames)
     return list(reader)
 
-# Поиск строки в таблице товаров
+
+def _tg_nick_or_fullname(update: Update) -> str:
+    """Return current Telegram identifier: @username if present else full_name."""
+    u = update.effective_user
+    if u and u.username:
+        return f"@{u.username}"
+    return (u.full_name if u else "unknown").strip()
+
+
+# -----------------------------
+# accounts lookup
+# -----------------------------
+def _find_account_by_nick(accounts: List[dict], nick: str) -> Optional[dict]:
+    n = (nick or "").strip()
+    if not n:
+        return None
+    for row in accounts:
+        if str(row.get("Ник", "")).strip() == n:
+            return row
+    return None
+
+
+def _resolve_game_username(accounts: List[dict], nick: str) -> Optional[str]:
+    row = _find_account_by_nick(accounts, nick)
+    if not row:
+        return None
+    return str(row.get("Имя пользователя", "")).strip()
+
+
+# -----------------------------
+# products lookup
+# -----------------------------
 def _find_product_by_name(rows, query):
     q = _normalize(query)
     if not q:
@@ -92,6 +134,9 @@ def _find_product_by_name(rows, query):
     return best_row
 
 
+# -----------------------------
+# config (env)
+# -----------------------------
 def _load_sell_cfg() -> Optional[dict]:
     """Loads Google Form configuration for SELL from env vars once."""
     global _cfg
@@ -125,6 +170,9 @@ def _load_sell_cfg() -> Optional[dict]:
     return _cfg
 
 
+# -----------------------------
+# pending
+# -----------------------------
 def _set_pending(context: ContextTypes.DEFAULT_TYPE, payload: dict) -> None:
     context.user_data[_PENDING_KEY] = payload
 
@@ -147,6 +195,9 @@ def _is_no(s: str) -> bool:
     return s in {"нет", "не", "no", "n"}
 
 
+# -----------------------------
+# forms
+# -----------------------------
 def _submit_form(url: str, payload: dict) -> Tuple[int, str]:
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",
@@ -157,6 +208,9 @@ def _submit_form(url: str, payload: dict) -> Tuple[int, str]:
     return r.status_code, preview
 
 
+# -----------------------------
+# public handlers
+# -----------------------------
 async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Usage: /sell <товар> <количество> <цена>"""
     if update.message is None:
@@ -169,12 +223,17 @@ async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     sheet_id = os.getenv("SHEET_ID") or None
     gid_items = os.getenv("GID_ITEMS") or None
-    if not sheet_id or not gid_items:
-        await update.message.reply_text("Команда /sell недоступна: не настроены переменные таблицы товаров (SHEET_ID/GID_ITEMS).")
+    gid_accounts = os.getenv("GID_ACCOUNTS") or None
+    if not sheet_id or not gid_items or not gid_accounts:
+        await update.message.reply_text(
+            "Команда /sell недоступна: не настроены переменные таблиц (SHEET_ID/GID_ITEMS/GID_ACCOUNTS)."
+        )
         return
 
     if not context.args or len(context.args) < 3:
-        await update.message.reply_text('Использование: /sell <товар> <количество> <цена>\nПример: /sell алмаз 20 45')
+        await update.message.reply_text(
+            'Использование: /sell <товар> <количество> <цена>\nПример: /sell алмаз 20 45'
+        )
         return
 
     raw_item = " ".join(context.args[:-2]).strip()
@@ -201,12 +260,33 @@ async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Цена должна быть больше нуля.")
         return
 
-    sender_u = (update.effective_user.username or "").strip()
-    if not sender_u:
-        await update.message.reply_text("Не удалось определить ваш username в Telegram. Установите username и попробуйте снова.")
-        return
-    sender_username = f"@{sender_u}"
+    # 1) берём текущий ник/имя в Telegram
+    tg_user = _tg_nick_or_fullname(update)
 
+    # 2) ищем в листе "Счета" строку, где "Ник" == tg_user
+    try:
+        accounts = await asyncio.to_thread(_fetch_rows, sheet_id, gid_accounts)
+    except Exception:
+        logger.exception("SELL: failed to fetch accounts from sheet")
+        await update.message.reply_text("Не удалось прочитать таблицу 'Счета'. Попробуйте позже.")
+        return
+
+    game_username = _resolve_game_username(accounts, tg_user)
+    if game_username is None:
+        await update.message.reply_text(
+            "Не удалось найти ваш аккаунт в таблице 'Счета' по колонке 'Ник'.\n"
+            f"Ожидался ник: {tg_user}"
+        )
+        return
+
+    if not game_username:
+        await update.message.reply_text(
+            "В таблице 'Счета' у вашего ника не заполнено поле 'Имя пользователя'.\n"
+            f"Ник: {tg_user}"
+        )
+        return
+
+    # 3) ищем товар в таблице товаров
     try:
         rows = await asyncio.to_thread(_fetch_rows, sheet_id, gid_items)
         logger.info("SELL: fetched %s products", len(rows))
@@ -219,13 +299,21 @@ async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not product:
         await update.message.reply_text(f'Не нашёл товар по запросу: "{raw_item}". Проверьте название.')
         return
-        
-    product_name = str(product["Название"]).strip()
 
+    product_name = str(product.get("Название", "")).strip()
+    item_id = str(product.get("Id товара", "")).strip()
+
+    if not item_id:
+        await update.message.reply_text(
+            f'У товара "{product_name or raw_item}" не заполнен столбец "Id товара" в таблице товаров.'
+        )
+        return
+
+    # 4) формируем payload: seller = внутриигровое имя
     payload = {
         cfg["entry_sale_id"]: str(uuid.uuid4()),
-        cfg["entry_seller"]: sender_username,
-        cfg["entry_item_id"]: str(product["Id товара"]).strip(),
+        cfg["entry_seller"]: str(game_username),
+        cfg["entry_item_id"]: item_id,
         cfg["entry_amount"]: str(qty),
         cfg["entry_price"]: _fmt_money_form(price),
     }
@@ -233,6 +321,7 @@ async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         f'Вы собираетесь продать {product_name} в количестве {qty} по {_fmt_money_human(price)}?\n'
+        f'Продавец: {game_username}\n'
         'Ответьте "да" или "нет".'
     )
 
@@ -252,7 +341,6 @@ async def sell_confirm_listener(update: Update, context: ContextTypes.DEFAULT_TY
             form_url = pending["form_url"]
             payload = pending["payload"]
 
-            # Вреенные логи
             logger.info("SELL: posting to form_url=%s", form_url)
 
             status, body_preview = await asyncio.to_thread(_submit_form, form_url, payload)
