@@ -36,7 +36,6 @@ def _parse_int(s: str, *, default: int = 0) -> int:
 
 
 def _parse_money(s: str) -> int:
-    # джк у тебя целые, но на всякий: 10 / 10.0 / "10,0"
     return _parse_int(s, default=0)
 
 
@@ -52,8 +51,7 @@ def _fetch_csv_text(sheet_id: str, gid: str) -> str:
     return (r.content or b"").decode("utf-8-sig", errors="replace")
 
 
-def _tg_nick(update: Update) -> str:
-    # Ник для сопоставления с колонкой 'Ник' на листе 'Счета'.
+def _tg_user(update: Update) -> str:
     u = update.effective_user
     if u and u.username:
         return f"@{u.username}"
@@ -64,7 +62,7 @@ def _tg_nick(update: Update) -> str:
 class OpenLot:
     ts: str
     sale_id: str
-    seller_user: str  # ожидается 'Ник' продавца из 'Счета'
+    seller_name: str
     item_id: str
     item_name: str
     remaining: int
@@ -72,40 +70,39 @@ class OpenLot:
 
 
 def _parse_open_lots(csv_text: str) -> List[OpenLot]:
-    # Парсим open_lots без зависимости от заголовков.
-    rows: List[List[str]] = []
-    reader = csv.reader(StringIO(csv_text))
-    for r in reader:
-        if not r:
-            continue
-        rows.append(r)
+    reader = csv.DictReader(StringIO(csv_text))
+
+    required_cols = {
+        "Дата",
+        "Id продажи",
+        "Продавец",
+        "Id товара",
+        "Товар",
+        "Количество",
+        "Цена",
+    }
+
+    if not required_cols.issubset(reader.fieldnames or []):
+        missing = required_cols - set(reader.fieldnames or [])
+        raise ValueError(f"В таблице 'Лоты' отсутствуют колонки: {', '.join(missing)}")
 
     lots: List[OpenLot] = []
-    for r in rows:
-        if len(r) < 7:
-            continue
 
-        maybe_header = _normalize(r[1]) in {"id операции", "id", "sale_id", "id продажи"} or _normalize(r[3]) in {
-            "id товара",
-            "item_id",
-        }
-        if maybe_header:
-            continue
-
-        ts, sale_id, seller_user, item_id, item_name, rem, price = r[0], r[1], r[2], r[3], r[4], r[5], r[6]
-        sale_id = str(sale_id).strip()
+    for row in reader:
+        sale_id = str(row["Id продажи"]).strip()
         if not sale_id:
             continue
 
         lot = OpenLot(
-            ts=str(ts).strip(),
+            ts=str(row["Дата"]).strip(),
             sale_id=sale_id,
-            seller_user=str(seller_user).strip(),
-            item_id=str(item_id).strip(),
-            item_name=str(item_name).strip(),
-            remaining=_parse_int(rem, default=0),
-            price=_parse_money(price),
+            seller_name=str(row["Продавец"]).strip(),
+            item_id=str(row["Id товара"]).strip(),
+            item_name=str(row["Товар"]).strip(),
+            remaining=_parse_int(row["Количество"]),
+            price=_parse_money(row["Цена"]),
         )
+
         if lot.remaining > 0 and lot.price >= 0:
             lots.append(lot)
 
@@ -307,7 +304,7 @@ async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text('Использование: /buy <товар> <количество>\nПример: /buy Медный блок 10')
         return
 
-    buyer_nick = _tg_nick(update)
+    buyer_user = _tg_user(update)
 
     await update.message.reply_text("Ищу открытые лоты...")
 
@@ -347,7 +344,7 @@ async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _set_pending(
         context,
         {
-            "buyer_nick": buyer_nick,
+            "buyer_user": buyer_user,
             "item_id": item_id,
             "item_name": item_name,
             "qty": qty,
@@ -355,7 +352,7 @@ async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "allocations": [
                 {
                     "sale_id": lot.sale_id,
-                    "seller_nick": lot.seller_user,
+                    "seller_name": lot.seller_name,
                     "item_id": lot.item_id,
                     "qty": take,
                     "price": lot.price,
@@ -406,7 +403,7 @@ async def buy_confirm_listener(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("Команда /buy недоступна: не настроены переменные окружения.")
         return
 
-    buyer_nick = str(pending.get("buyer_nick", "")).strip()
+    buyer_user = str(pending.get("buyer_user", "")).strip()
     total_cost = int(pending["total_cost"])
     allocations = pending["allocations"]
 
@@ -417,17 +414,17 @@ async def buy_confirm_listener(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("Не удалось проверить баланс. Попробуйте позже.")
         return
 
-    buyer_info = _get_balance_and_game_username(accounts, buyer_nick)
+    buyer_info = _get_balance_and_game_username(accounts, buyer_user)
     if buyer_info is None:
         _clear_pending(context)
         await update.message.reply_text(
             "Не удалось найти ваш ник в таблице 'Счета'.\n"
-            f"Ожидался ник: {buyer_nick}"
+            f"Ожидался ник: {buyer_user}"
         )
         return
 
-    balance, buyer_game = buyer_info
-    if not buyer_game:
+    balance, buyer_name = buyer_info
+    if not buyer_name:
         _clear_pending(context)
         await update.message.reply_text("В таблице 'Счета' у вашего ника не заполнено поле 'Имя пользователя'.")
         return
@@ -437,42 +434,15 @@ async def buy_confirm_listener(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(f"Недостаточно средств. Нужно {total_cost} джк, у вас {balance} джк.")
         return
 
-    seller_game_by_nick: Dict[str, str] = {}
-    for a in allocations:
-        s_nick = str(a.get("seller_nick", "")).strip()
-        if not s_nick:
-            continue
-        if s_nick in seller_game_by_nick:
-            continue
-
-        info = _get_balance_and_game_username(accounts, s_nick)
-        if info is None:
-            _clear_pending(context)
-            await update.message.reply_text(
-                "Не удалось найти продавца в таблице 'Счета'.\n"
-                f"Ник продавца: {s_nick}"
-            )
-            return
-        _, s_game = info
-        if not s_game:
-            _clear_pending(context)
-            await update.message.reply_text(
-                "В таблице 'Счета' у продавца не заполнено поле 'Имя пользователя'.\n"
-                f"Ник продавца: {s_nick}"
-            )
-            return
-        seller_game_by_nick[s_nick] = s_game
-
     buy_form_url = cfg["buy_form_url"]
     try:
         for a in allocations:
-            s_nick = str(a.get("seller_nick", "")).strip()
-            seller_game = seller_game_by_nick.get(s_nick, s_nick)
+            seller_name = str(a.get("seller_name", "")).strip()
 
             payload = {
                 cfg["buy_entry_sale_id"]: str(a["sale_id"]),
-                cfg["buy_entry_seller"]: str(seller_game),
-                cfg["buy_entry_buyer"]: str(buyer_game),
+                cfg["buy_entry_seller"]: seller_name,
+                cfg["buy_entry_buyer"]: str(buyer_name),
                 cfg["buy_entry_item_id"]: str(a["item_id"]),
                 cfg["buy_entry_amount"]: str(int(a["qty"])),
                 cfg["buy_entry_price"]: str(int(a["price"])),
@@ -492,16 +462,15 @@ async def buy_confirm_listener(update: Update, context: ContextTypes.DEFAULT_TYP
 
     seller_totals: Dict[str, int] = {}
     for a in allocations:
-        s_nick = str(a.get("seller_nick", "")).strip()
-        s_game = seller_game_by_nick.get(s_nick, s_nick)
-        seller_totals[s_game] = seller_totals.get(s_game, 0) + int(a.get("qty", 0)) * int(a.get("price", 0))
+        seller_name = str(a.get("seller_name", "")).strip()
+        seller_totals[seller_name] = seller_totals.get(seller_name, 0) + int(a.get("qty", 0)) * int(a.get("price", 0))
 
     try:
-        for seller_game, seller_sum in seller_totals.items():
+        for seller_name, seller_sum in seller_totals.items():
             payload = {
-                cfg["pay_entry_sender"]: str(buyer_game),
+                cfg["pay_entry_sender"]: str(buyer_name),
                 cfg["pay_entry_sender_comment"]: f"Покупка: {item_name} ({seller_sum} джк)",
-                cfg["pay_entry_recipient"]: str(seller_game),
+                cfg["pay_entry_recipient"]: str(seller_name),
                 cfg["pay_entry_recipient_comment"]: f"Продажа: {item_name} ({seller_sum} джк)",
                 cfg["pay_entry_sum"]: str(int(seller_sum)),
             }
@@ -510,7 +479,7 @@ async def buy_confirm_listener(update: Update, context: ContextTypes.DEFAULT_TYP
                 "BUY: submit(PAY) status=%s preview=%r recipient=%s sum=%s",
                 status,
                 preview,
-                seller_game,
+                seller_name,
                 seller_sum,
             )
             if not (200 <= status < 400):
