@@ -87,7 +87,7 @@ def _load_accounts_rows():
 
 from commands.help import help_cmd
 from commands.balance import balance, init_balance_helpers
-from commands.price import price, price_followup_listener, init_price_helpers
+from commands.price import price
 from commands.pay import pay as pay_cmd, init_pay_helpers
 from commands.ops import ops, init_ops_helpers
 from commands.sell import sell, sell_confirm_listener
@@ -116,9 +116,6 @@ async def _unified_text_listener(update: Update, context: ContextTypes.DEFAULT_T
         return
     if context.user_data.get("pending_buy"):
         await buy_confirm_listener(update, context)
-        return
-    if context.user_data.get("pending_price"):
-        await price_followup_listener(update, context)
         return
 
 async def _on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
