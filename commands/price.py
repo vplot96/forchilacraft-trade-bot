@@ -127,7 +127,7 @@ def build_price_text(query: str) -> str:
 
     lines.append("")  # blank line between blocks
 
-    lines.append(f"Сейчас продаются ({_format_num(stock_market)})")
+    lines.append(f"*Сейчас продаются ({_format_num(stock_market)})*")
     if min_price is None or stock_market <= 0:
         lines.append("— товар отсутствует")
     else:
