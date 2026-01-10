@@ -187,12 +187,12 @@ def _clear_pending(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 def _is_yes(s: str) -> bool:
     s = _normalize(_strip_trailing_punct(s))
-    return s in {"да", "ага", "yes", "y", "ok", "ок"}
+    return s in {"да"}
 
 
 def _is_no(s: str) -> bool:
     s = _normalize(_strip_trailing_punct(s))
-    return s in {"нет", "не", "no", "n"}
+    return s in {"нет"}
 
 
 # -----------------------------
@@ -218,7 +218,7 @@ async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     cfg = _load_sell_cfg()
     if cfg is None:
-        await update.message.reply_text("Команда /sell недоступна: не настроены переменные Google Forms.")
+        await update.message.reply_text("Команда /sell выполнилась с ошибкой")
         return
 
     sheet_id = os.getenv("SHEET_ID") or None
@@ -226,13 +226,13 @@ async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
     gid_accounts = os.getenv("GID_ACCOUNTS") or None
     if not sheet_id or not gid_items or not gid_accounts:
         await update.message.reply_text(
-            "Команда /sell недоступна: не настроены переменные таблиц (SHEET_ID/GID_ITEMS/GID_ACCOUNTS)."
+            "Команда /sell выполнилась с ошибкой"
         )
         return
 
     if not context.args or len(context.args) < 3:
         await update.message.reply_text(
-            'Использование: /sell <товар> <количество> <цена>\nПример: /sell алмаз 20 45'
+            'Использование: /sell <товар> <количество> <цена>'
         )
         return
 
@@ -268,22 +268,16 @@ async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
         accounts = await asyncio.to_thread(_fetch_rows, sheet_id, gid_accounts)
     except Exception:
         logger.exception("SELL: failed to fetch accounts from sheet")
-        await update.message.reply_text("Не удалось прочитать таблицу 'Счета'. Попробуйте позже.")
+        await update.message.reply_text("Возникла ошибка при чтении данных.")
         return
 
     game_username = _resolve_game_username(accounts, tg_user)
     if game_username is None:
-        await update.message.reply_text(
-            "Не удалось найти ваш аккаунт в таблице 'Счета' по колонке 'Ник'.\n"
-            f"Ожидался ник: {tg_user}"
-        )
+        await update.message.reply_text("Не удалось найти ваш аккаунт. Уточните ваши данные аккаунта.")
         return
 
     if not game_username:
-        await update.message.reply_text(
-            "В таблице 'Счета' у вашего ника не заполнено поле 'Имя пользователя'.\n"
-            f"Ник: {tg_user}"
-        )
+        await update.message.reply_text("Ошибка при обращении к вашему аккаунту. Уточните ваши данные аккаунта.")
         return
 
     # 3) ищем товар в таблице товаров
@@ -297,16 +291,14 @@ async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     product = _find_product_by_name(rows, raw_item)
     if not product:
-        await update.message.reply_text(f'Не нашёл товар по запросу: "{raw_item}". Проверьте название.')
+        await update.message.reply_text("Не нашёл товар по вашему запросу. Возможно этот товар не продаётся на бирже.")
         return
 
     product_name = str(product.get("Название", "")).strip()
     item_id = str(product.get("Id товара", "")).strip()
 
     if not item_id:
-        await update.message.reply_text(
-            f'У товара "{product_name or raw_item}" не заполнен столбец "Id товара" в таблице товаров.'
-        )
+        await update.message.reply_text("Ошибка при получении данных об этом товаре.")
         return
 
     # 4) формируем payload: seller = внутриигровое имя
@@ -321,7 +313,6 @@ async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         f'Вы собираетесь продать {product_name} в количестве {qty} по {_fmt_money_human(price)}?\n'
-        f'Продавец: {game_username}\n'
         'Ответьте "да" или "нет".'
     )
 
@@ -365,7 +356,7 @@ async def sell_confirm_listener(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("Операция отменена.")
         return
 
-    await update.message.reply_text('Мне нужен чёткий ответ: "да" или "нет".')
+    await update.message.reply_text('Мне нужен ответ: "да" или "нет".')
 
 
 def get_handlers():
