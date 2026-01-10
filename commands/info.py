@@ -21,10 +21,6 @@ DAYS_30 = 30
 UTC = timezone.utc
 
 
-# ============================================================
-# Public entrypoints (то, что читателю важно увидеть первым)
-# ============================================================
-
 async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /info
@@ -39,16 +35,8 @@ async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text, parse_mode="Markdown")
     except Exception:
         logger.exception("INFO command failed")
-        await update.message.reply_text(
-            "❗ Не удалось сформировать /info.\n"
-            "Проверь переменные окружения (SHEET_ID, GID_ITEMS, GID_OPEN_LOTS, GID_SALES)\n"
-            "и точные названия колонок в таблицах."
-        )
+        await update.message.reply_text("Не удалось выполнить команду /info.")
 
-
-# ============================================================
-# Core logic (вся “математика” и формирование текста)
-# ============================================================
 
 def build_global_text() -> str:
     sheet_id, gid_items, gid_open_lots, gid_sales = _load_cfg()
@@ -93,40 +81,34 @@ def build_global_text() -> str:
         return id_to_name.get(item_id, item_id)
 
     # 1) Top turnover all-time
-    top_turnover: List[Tuple[str, float, float]] = []
+    top_turnover_all: List[Tuple[str, float, float]] = []
     for item_id, ss in sales_by_item.items():
         t = _turnover(ss)
         if t > 0:
-            top_turnover.append((item_id, t, _sum_qty(ss)))
-    top_turnover.sort(key=lambda x: x[1], reverse=True)
-    top_turnover = top_turnover[:TOP_N]
+            top_turnover_all.append((item_id, t, _sum_qty(ss)))
+    top_turnover_all.sort(key=lambda x: x[1], reverse=True)
+    top_turnover_all = top_turnover_all[:TOP_N]
 
-    # 2) Brightest avg price changes (30d vs all) by |delta|
-    deltas: List[Tuple[str, float, float, float]] = []
+    # 2) Top turnover last 30 days
+    top_turnover_30d: List[Tuple[str, float, float]] = []
     for item_id, ss in sales_by_item.items():
         ss30 = [(dt, q, p) for (dt, q, p) in ss if dt >= cutoff_30d]
         if not ss30:
             continue
-        avg_all = _weighted_avg(ss)
-        avg_30 = _weighted_avg(ss30)
-        if avg_all is None or avg_30 is None:
-            continue
-        # "изменилось" по округлению до 2 знаков
-        if round(avg_all, 2) == round(avg_30, 2):
-            continue
-        delta = avg_30 - avg_all
-        deltas.append((item_id, delta, avg_30, avg_all))
-    deltas.sort(key=lambda x: abs(x[1]), reverse=True)
-    deltas = deltas[:TOP_N]
+        t30 = _turnover(ss30)
+        if t30 > 0:
+            top_turnover_30d.append((item_id, t30, _sum_qty(ss30)))
+    top_turnover_30d.sort(key=lambda x: x[1], reverse=True)
+    top_turnover_30d = top_turnover_30d[:TOP_N]
 
     # 3) Cheapest items by avg price of 100 cheapest units
-    cheapest: List[Tuple[str, float, float]] = []
+    cheapest: List[Tuple[str, float]] = []
     for item_id, lots in lots_by_item.items():
         r = _avg_price_of_cheapest_units(lots, CHEAP_UNITS_SAMPLE)
         if not r:
             continue
-        avg, taken = r
-        cheapest.append((item_id, avg, taken))
+        avg, _taken = r
+        cheapest.append((item_id, avg))
     cheapest.sort(key=lambda x: x[1])
     cheapest = cheapest[:TOP_N]
 
@@ -135,45 +117,46 @@ def build_global_text() -> str:
     rarest.sort(key=lambda x: x[1])
     rarest = rarest[:TOP_N]
 
-    # ---- render ----
+    def _render_turnover_rows(rows: List[Tuple[str, float, float]]) -> List[str]:
+        out: List[str] = []
+        for i, (item_id, t, q) in enumerate(rows, 1):
+            out.append(f"{i}. {name(item_id)}: {_format_num(t)} джк ({_format_num(q)} шт.)")
+        return out
+
     lines: List[str] = []
     lines.append("*Сводка биржи*")
     lines.append("")
 
     lines.append("*Топ товаров по обороту (за всё время)*")
-    if top_turnover:
-        for i, (item_id, t, q) in enumerate(top_turnover, 1):
-            lines.append(f"{i}. {name(item_id)} — {_format_num(t)} джк (продано: {_format_num(q)})")
+    if top_turnover_all:
+        lines.extend(_render_turnover_rows(top_turnover_all))
     else:
-        lines.append("— нет данных по сделкам")
+        lines.append("— нет данных")
     lines.append("")
 
-    lines.append("*Яркие изменения средней цены (30 дней vs всё время)*")
-    if deltas:
-        for i, (item_id, delta, avg30, avgall) in enumerate(deltas, 1):
-            sign = "+" if delta > 0 else "−"
-            lines.append(f"{i}. {name(item_id)} — {_format_num(avg30)} → {_format_num(avgall)} ({sign}{_format_num(abs(delta))})")
+    lines.append("*Топ товаров по обороту (за 30 дней)*")
+    if top_turnover_30d:
+        lines.extend(_render_turnover_rows(top_turnover_30d))
     else:
-        lines.append("— за последние 30 дней средняя цена не изменилась ни по одному товару")
+        lines.append("— нет данных")
     lines.append("")
 
-    lines.append(f"*Самые дешёвые товары (ср. по {CHEAP_UNITS_SAMPLE} самым дешёвым единицам)*")
+    lines.append("*Самые дешёвые товары на бирже*")
     if cheapest:
-        for i, (item_id, avg, taken) in enumerate(cheapest, 1):
-            suffix = f" (ср. по {_format_num(taken)} шт)" if taken < CHEAP_UNITS_SAMPLE else ""
-            lines.append(f"{i}. {name(item_id)} — ~{_format_num(avg)} джк{suffix}")
+        for i, (item_id, avg) in enumerate(cheapest, 1):
+            lines.append(f"{i}. {name(item_id)}: ~{_format_num(avg)} джк")
     else:
-        lines.append("— нет открытых лотов")
+        lines.append("— нет данных")
     lines.append("")
 
     lines.append("*Самые редкие товары на бирже*")
     if rarest:
         for i, (item_id, stock) in enumerate(rarest, 1):
-            lines.append(f"{i}. {name(item_id)} — {_format_num(stock)} шт")
+            lines.append(f"{i}. {name(item_id)}: {_format_num(stock)} шт")
     else:
-        lines.append("— нет открытых лотов")
+        lines.append("— нет данных")
     lines.append("")
-    lines.append("Подробнее: `/info <название товара>`")
+    lines.append("Подробнее: /info <название товара>")
 
     return "\n".join(lines)
 
@@ -185,11 +168,11 @@ def build_item_text(query: str) -> str:
 
     q = (query or "").strip()
     if not q:
-        return "❗ Укажи товар: `/info <название товара>`"
+        return 'Введите команду: /info <название товара>'
 
     item_id = q if q in id_to_name else name_to_id.get(_normalize(q))
     if not item_id:
-        return "❗ Не понял товар. Введи точное название как в таблице «Товары»."
+        return "Не удалось найти товар по введённому названию. Уточните, продаётся ли он на бирже."
 
     lots_rows = _fetch_rows_dict(sheet_id, gid_open_lots)
     sales_rows = _fetch_rows_dict(sheet_id, gid_sales)
@@ -218,9 +201,9 @@ def build_item_text(query: str) -> str:
         if dt >= cutoff_30d:
             sales_30.append(tup)
 
-    # ---- lots for this item (без продавцов) ----
-    lots_item: List[Tuple[float, float]] = []
+    # ---- lots for this item ----
     stock_market = 0.0
+    grouped: Dict[float, float] = {}  # price -> total qty on market
     for r in lots_rows:
         if str(r.get("Id товара", "")).strip() != item_id:
             continue
@@ -228,55 +211,76 @@ def build_item_text(query: str) -> str:
         price = _to_float(r.get("Цена"))
         if qty <= 0 or price <= 0:
             continue
-        lots_item.append((price, qty))
+
         stock_market += qty
+
+        # чтобы 45 и 45.0 не расходились из-за float
+        pkey = round(float(price), 6)
+        grouped[pkey] = grouped.get(pkey, 0.0) + float(qty)
 
     avg_all = _weighted_avg(sales_item)
     avg_30 = _weighted_avg(sales_30)
+
     sold_all = _sum_qty(sales_item)
     sold_30 = _sum_qty(sales_30)
 
-    # ---- group cheapest lots by price: price -> total qty ----
-    lots_item.sort(key=lambda x: x[0])
-    grouped: Dict[float, float] = {}
-    for price, qty in lots_item:
-        key = round(float(price), 6)  # защита от 45 vs 45.0
-        grouped[key] = grouped.get(key, 0.0) + float(qty)
-    cheapest_prices = sorted(grouped.items(), key=lambda x: x[0])[:TOP_N]
-
     name = id_to_name.get(item_id, item_id)
 
+    # ---- render ----
     lines: List[str] = []
-    lines.append(f"*{name}*")
+    lines.append(f'Сводка по товару "{name}"')
     lines.append("")
-    lines.append(f"Количество на бирже: *{_format_num(stock_market)}* шт")
+    lines.append(f"Доступно на бирже: {_format_num(stock_market)} шт")
     lines.append("")
-    lines.append("*Цена продаж (по фактическим сделкам)*")
-    lines.append(f"• средняя за всё время: {(_format_num(avg_all) + ' джк') if avg_all is not None else '— нет данных'}")
-    lines.append(f"• средняя за 30 дней: {(_format_num(avg_30) + ' джк') if avg_30 is not None else '— нет данных'}")
-    lines.append("")
-    lines.append("*Объёмы продаж (по сделкам)*")
-    lines.append(f"• продано за всё время: {_format_num(sold_all)} шт")
-    lines.append(f"• продано за 30 дней: {_format_num(sold_30)} шт")
-    lines.append("")
-    lines.append("*Самые дешёвые лоты (топ-7 цен)*")
-    if cheapest_prices:
-        for price, qty_sum in cheapest_prices:
-            lines.append(f"• {_format_num(price)} джк × {_format_num(qty_sum)}")
+
+    # Цена продажи (ср.)
+    lines.append("Цена продажи (ср.)")
+    if avg_all is None:
+        lines.append("— нет данных")
     else:
-        lines.append("— сейчас лотов нет")
+        lines.append(f"— {_format_num(avg_all)} джк (всё время)")
+        if avg_30 is None:
+            lines.append("— нет данных (30 дней)")
+        else:
+            lines.append(f"— {_format_num(avg_30)} джк (30 дней)")
+    lines.append("")
+
+    # Объёмы продаж
+    lines.append("Объёмы продаж")
+    if sold_all <= 0:
+        lines.append("— нет данных")
+    else:
+        lines.append(f"— {_format_num(sold_all)} шт (всё время)")
+        if sold_30 <= 0:
+            lines.append("— нет данных (30 дней)")
+        else:
+            lines.append(f"— {_format_num(sold_30)} шт (30 дней)")
+    lines.append("")
+
+    # Сейчас продаются (сгруппировано по цене)
+    lines.append("Сейчас продаются")
+    if not grouped:
+        lines.append("— товар отсутствует")
+        return "\n".join(lines)
+
+    price_levels = sorted(grouped.items(), key=lambda x: x[0])  # (price, qty_sum)
+    if len(price_levels) > TOP_N:
+        shown = price_levels[: TOP_N - 1]
+        for i, (price, qty_sum) in enumerate(shown, 1):
+            lines.append(f"{i}. {_format_num(price)} джк ({_format_num(qty_sum)} шт)")
+        lines.append(f"{TOP_N}. ...")
+    else:
+        for i, (price, qty_sum) in enumerate(price_levels, 1):
+            lines.append(f"{i}. {_format_num(price)} джк ({_format_num(qty_sum)} шт)")
 
     return "\n".join(lines)
 
 
 # ============================================================
-# Helpers (все утилиты ниже — “детали реализации”)
+# Helpers
 # ============================================================
 
 def _load_cfg() -> Tuple[str, str, str, str]:
-    """
-    Возвращает: sheet_id, gid_items, gid_open_lots, gid_sales
-    """
     sheet_id = os.getenv("SHEET_ID", "").strip()
     gid_items = os.getenv("GID_ITEMS", "").strip()
     gid_open_lots = os.getenv("GID_OPEN_LOTS", "").strip()
