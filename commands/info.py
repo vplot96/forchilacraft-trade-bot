@@ -69,7 +69,7 @@ def build_global_text() -> str:
     sales_rows = _fetch_rows_dict(sheet_id, gid_sales)
 
     _ensure_columns(lots_rows, ["Id товара", "Количество", "Цена"], "Лоты")
-    _ensure_columns(sales_rows, ["Отметка времени", "Id товара", "Количество", "Цена"], "Сделки")
+    _ensure_columns(sales_rows, ["Отметка времени", "Id товара", "Количество", "Цена", "Продавец", "Покупатель"], "Сделки")
 
     # ---- sales grouped by item_id ----
     sales_by_item: Dict[str, List[Tuple[datetime, float, float]]] = {}
@@ -77,6 +77,12 @@ def build_global_text() -> str:
         dt = _parse_dt(r.get("Отметка времени"))
         if not dt:
             continue
+
+        seller = str(r.get("Продавец", "")).strip()
+        buyer = str(r.get("Покупатель", "")).strip()
+        if seller and buyer and _normalize(seller) == _normalize(buyer):
+            continue
+
         item_id = str(r.get("Id товара", "")).strip()
         qty = _to_float(r.get("Количество"))
         price = _to_float(r.get("Цена"))
@@ -198,7 +204,7 @@ def build_item_text(item_id: str, item_name: str) -> str:
     sales_rows = _fetch_rows_dict(sheet_id, gid_sales)
 
     _ensure_columns(lots_rows, ["Id товара", "Количество", "Цена"], "Лоты")
-    _ensure_columns(sales_rows, ["Отметка времени", "Id товара", "Количество", "Цена"], "Сделки")
+    _ensure_columns(sales_rows, ["Отметка времени", "Id товара", "Количество", "Цена", "Продавец", "Покупатель"], "Сделки")
 
     # ---- соберём все продажи (для "в месяц" по истории биржи) ----
     all_sales: List[Tuple[datetime, float, float, str]] = []
@@ -206,6 +212,12 @@ def build_item_text(item_id: str, item_name: str) -> str:
         dt = _parse_dt(r.get("Отметка времени"))
         if not dt:
             continue
+    
+        seller = str(r.get("Продавец", "")).strip()
+        buyer = str(r.get("Покупатель", "")).strip()
+        if seller and buyer and _normalize(seller) == _normalize(buyer):
+            continue
+    
         iid = str(r.get("Id товара", "")).strip()
         qty = _to_float(r.get("Количество"))
         price = _to_float(r.get("Цена"))
