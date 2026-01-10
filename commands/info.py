@@ -8,6 +8,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from io import StringIO
 from typing import Dict, List, Optional, Tuple
+from difflib import SequenceMatcher
 
 import requests
 from telegram import Update
@@ -43,13 +44,15 @@ async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         id_to_name, name_to_id = _load_items_map(sheet_id, gid_items)
 
         q = (arg or "").strip()
-        item_id = q if q in id_to_name else name_to_id.get(_normalize(q))
-        if not item_id:
-            await update.message.reply_text("Не нашёл товаров по вашему запросу. Возможно этот товар не продаётся на бирже.")
+        found = _find_item_by_name(id_to_name, q, threshold=0.65)
+        if not found:
+            await update.message.reply_text("Не удалось найти товар по введённому названию. Возможно этот товар не продаётся на бирже.")
             return
 
+        item_id, name, ratio = found
+
         wait_msg = await update.message.reply_text("Собираю актуальную статистику...")
-        text = build_item_text(item_id=item_id, item_name=id_to_name.get(item_id, item_id))
+        text = build_item_text(item_id=item_id, item_name=name)
         await wait_msg.edit_text(text, parse_mode="Markdown")
 
     except Exception:
@@ -376,6 +379,39 @@ def _format_num(x: float) -> str:
     if abs(x - round(x)) < 1e-9:
         return f"{int(round(x)):,}".replace(",", " ")
     return f"{x:,.2f}".replace(",", " ").replace(".", ",")
+
+
+def _find_item_by_name(
+    id_to_name: Dict[str, str],
+    query: str,
+    threshold: float = 0.67,
+) -> Optional[Tuple[str, str, float]]:
+    q = _normalize(query)
+    if not q:
+        return None
+
+    best_id = None
+    best_name = None
+    best_ratio = 0.0
+
+    for item_id, name in id_to_name.items():
+        n = _normalize(name)
+        if n == q:
+            return item_id, name, 1.0
+
+        ratio = SequenceMatcher(None, q, n).ratio()
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_id = item_id
+            best_name = name
+
+    if best_id is None:
+        return None
+
+    if best_ratio < threshold:
+        return None
+
+    return best_id, best_name or best_id, best_ratio
 
 
 def _load_items_map(sheet_id: str, gid_items: str) -> Tuple[Dict[str, str], Dict[str, str]]:
