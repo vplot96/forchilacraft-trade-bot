@@ -16,7 +16,6 @@ from telegram.ext import ContextTypes
 logger = logging.getLogger(__name__)
 
 TOP_N = 7
-CHEAP_UNITS_SAMPLE = 100
 DAYS_30 = 30
 UTC = timezone.utc
 
@@ -31,8 +30,28 @@ async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         arg = " ".join(context.args) if context and context.args else ""
-        text = build_global_text() if not arg else build_item_text(arg)
-        await update.message.reply_text(text, parse_mode="Markdown")
+
+        # /info (общая сводка): всегда показываем ожидание
+        if not arg:
+            wait_msg = await update.message.reply_text("Собираю актуальную статистику...")
+            text = build_global_text()
+            await wait_msg.edit_text(text, parse_mode="Markdown")
+            return
+
+        # /info <товар>: сначала быстрый поиск товара в "Товары"
+        sheet_id, gid_items, gid_open_lots, gid_sales = _load_cfg()
+        id_to_name, name_to_id = _load_items_map(sheet_id, gid_items)
+
+        q = (arg or "").strip()
+        item_id = q if q in id_to_name else name_to_id.get(_normalize(q))
+        if not item_id:
+            await update.message.reply_text("Не нашёл товар по вашему запросу. Возможно такой товар не продаётся на бирже.")
+            return
+
+        wait_msg = await update.message.reply_text("Собираю актуальную статистику...")
+        text = build_item_text(item_id=item_id, item_name=id_to_name.get(item_id, item_id))
+        await wait_msg.edit_text(text, parse_mode="Markdown")
+
     except Exception:
         logger.exception("INFO command failed")
         await update.message.reply_text("Не удалось выполнить команду /info.")
@@ -89,7 +108,7 @@ def build_global_text() -> str:
     top_turnover_all.sort(key=lambda x: x[1], reverse=True)
     top_turnover_all = top_turnover_all[:TOP_N]
 
-    # 2) Top turnover last 30 days
+    # 2) Top turnover last 30 days (оставляем как было)
     top_turnover_30d: List[Tuple[str, float, float]] = []
     for item_id, ss in sales_by_item.items():
         ss30 = [(dt, q, p) for (dt, q, p) in ss if dt >= cutoff_30d]
@@ -101,21 +120,29 @@ def build_global_text() -> str:
     top_turnover_30d.sort(key=lambda x: x[1], reverse=True)
     top_turnover_30d = top_turnover_30d[:TOP_N]
 
-    # 3) Cheapest items by avg price of 100 cheapest units
-    cheapest: List[Tuple[str, float]] = []
+    # 3) Самые дешёвые товары
+    cheapest_items: List[Tuple[str, float, float]] = []  # (item_id, min_price, qty_at_min_price)
     for item_id, lots in lots_by_item.items():
-        r = _avg_price_of_cheapest_units(lots, CHEAP_UNITS_SAMPLE)
-        if not r:
+        if not lots:
             continue
-        avg, _taken = r
-        cheapest.append((item_id, avg))
-    cheapest.sort(key=lambda x: x[1])
-    cheapest = cheapest[:TOP_N]
+        min_price = min(p for p, _q in lots)
+        qty_at_min = sum(q for p, q in lots if p == min_price)
+        cheapest_items.append((item_id, min_price, qty_at_min))
+    cheapest_items.sort(key=lambda x: x[1])
+    cheapest_items = cheapest_items[:TOP_N]
 
-    # 4) Rarest items by market stock
-    rarest: List[Tuple[str, float]] = [(item_id, stock) for item_id, stock in stock_by_item.items() if stock > 0]
-    rarest.sort(key=lambda x: x[1])
-    rarest = rarest[:TOP_N]
+    # 4) Самые редкие товары
+    rarest_items: List[Tuple[str, float, float]] = []  # (item_id, min_price, total_stock)
+    for item_id, stock in stock_by_item.items():
+        if stock <= 0:
+            continue
+        lots = lots_by_item.get(item_id, [])
+        if not lots:
+            continue
+        min_price = min(p for p, _q in lots)
+        rarest_items.append((item_id, min_price, stock))
+    rarest_items.sort(key=lambda x: x[2])  # по stock
+    rarest_items = rarest_items[:TOP_N]
 
     def _render_turnover_rows(rows: List[Tuple[str, float, float]]) -> List[str]:
         out: List[str] = []
@@ -142,17 +169,17 @@ def build_global_text() -> str:
     lines.append("")
 
     lines.append("*Самые дешёвые товары на бирже*")
-    if cheapest:
-        for i, (item_id, avg) in enumerate(cheapest, 1):
-            lines.append(f"{i}. {name(item_id)}: ~{_format_num(avg)} джк")
+    if cheapest_items:
+        for i, (item_id, min_price, qty_at_min) in enumerate(cheapest_items, 1):
+            lines.append(f"{i}. {name(item_id)}: {_format_num(min_price)} джк ({_format_num(qty_at_min)} шт.)")
     else:
         lines.append("— нет данных")
     lines.append("")
 
     lines.append("*Самые редкие товары на бирже*")
-    if rarest:
-        for i, (item_id, stock) in enumerate(rarest, 1):
-            lines.append(f"{i}. {name(item_id)}: {_format_num(stock)} шт")
+    if rarest_items:
+        for i, (item_id, min_price, stock) in enumerate(rarest_items, 1):
+            lines.append(f"{i}. {name(item_id)}: {_format_num(min_price)} джк ({_format_num(stock)} шт.)")
     else:
         lines.append("— нет данных")
     lines.append("")
@@ -161,18 +188,8 @@ def build_global_text() -> str:
     return "\n".join(lines)
 
 
-def build_item_text(query: str) -> str:
+def build_item_text(item_id: str, item_name: str) -> str:
     sheet_id, gid_items, gid_open_lots, gid_sales = _load_cfg()
-
-    id_to_name, name_to_id = _load_items_map(sheet_id, gid_items)
-
-    q = (query or "").strip()
-    if not q:
-        return 'Введите команду: /info <название товара>'
-
-    item_id = q if q in id_to_name else name_to_id.get(_normalize(q))
-    if not item_id:
-        return "Не удалось найти товар по введённому названию. Уточните, продаётся ли он на бирже."
 
     lots_rows = _fetch_rows_dict(sheet_id, gid_open_lots)
     sales_rows = _fetch_rows_dict(sheet_id, gid_sales)
@@ -180,28 +197,44 @@ def build_item_text(query: str) -> str:
     _ensure_columns(lots_rows, ["Id товара", "Количество", "Цена"], "Лоты")
     _ensure_columns(sales_rows, ["Отметка времени", "Id товара", "Количество", "Цена"], "Сделки")
 
-    now = datetime.now(tz=UTC)
-    cutoff_30d = now - timedelta(days=DAYS_30)
-
-    # ---- sales for this item ----
-    sales_item: List[Tuple[datetime, float, float]] = []
-    sales_30: List[Tuple[datetime, float, float]] = []
+    # ---- соберём все продажи (для "в месяц" по истории биржи) ----
+    all_sales: List[Tuple[datetime, float, float, str]] = []
     for r in sales_rows:
-        if str(r.get("Id товара", "")).strip() != item_id:
-            continue
         dt = _parse_dt(r.get("Отметка времени"))
         if not dt:
             continue
+        iid = str(r.get("Id товара", "")).strip()
         qty = _to_float(r.get("Количество"))
         price = _to_float(r.get("Цена"))
-        if qty <= 0 or price <= 0:
+        if not iid or qty <= 0 or price <= 0:
             continue
-        tup = (dt, qty, price)
-        sales_item.append(tup)
-        if dt >= cutoff_30d:
-            sales_30.append(tup)
+        all_sales.append((dt, qty, price, iid))
 
-    # ---- lots for this item ----
+    now = datetime.now(tz=UTC)
+    first_sale_dt = min((dt for dt, _q, _p, _iid in all_sales), default=None)
+    if first_sale_dt is None:
+        months_since_first = 1.0
+    else:
+        days = max(1, (now - first_sale_dt).days)
+        months_since_first = max(1.0, days / 30.0)
+
+    # ---- продажи по этому товару ----
+    sales_item: List[Tuple[datetime, float, float]] = []
+    for dt, qty, price, iid in all_sales:
+        if iid == item_id:
+            sales_item.append((dt, qty, price))
+
+    avg_all = _weighted_avg(sales_item)
+
+    # последние 10 сделок (недавно)
+    sales_item_sorted = sorted(sales_item, key=lambda x: x[0], reverse=True)
+    last10 = sales_item_sorted[:10]
+    avg_recent10 = _weighted_avg(last10)
+
+    sold_all = _sum_qty(sales_item)
+    sold_per_month = (sold_all / months_since_first) if sold_all > 0 else 0.0
+
+    # ---- лоты по этому товару (группировка по цене) ----
     stock_market = 0.0
     grouped: Dict[float, float] = {}  # price -> total qty on market
     for r in lots_rows:
@@ -213,52 +246,36 @@ def build_item_text(query: str) -> str:
             continue
 
         stock_market += qty
-
-        # чтобы 45 и 45.0 не расходились из-за float
         pkey = round(float(price), 6)
         grouped[pkey] = grouped.get(pkey, 0.0) + float(qty)
 
-    avg_all = _weighted_avg(sales_item)
-    avg_30 = _weighted_avg(sales_30)
-
-    sold_all = _sum_qty(sales_item)
-    sold_30 = _sum_qty(sales_30)
-
-    name = id_to_name.get(item_id, item_id)
-
     # ---- render ----
     lines: List[str] = []
-    lines.append(f'Сводка по товару "{name}"')
+    lines.append(f'*Сводка по товару "{item_name}"*')
     lines.append("")
     lines.append(f"Доступно на бирже: {_format_num(stock_market)} шт")
     lines.append("")
 
-    # Цена продажи (ср.)
-    lines.append("Цена продажи (ср.)")
+    lines.append("*Цена продажи (ср.)*")
     if avg_all is None:
         lines.append("— нет данных")
     else:
         lines.append(f"— {_format_num(avg_all)} джк (всё время)")
-        if avg_30 is None:
-            lines.append("— нет данных (30 дней)")
+        if avg_recent10 is None:
+            lines.append("— нет данных (недавно)")
         else:
-            lines.append(f"— {_format_num(avg_30)} джк (30 дней)")
+            lines.append(f"— {_format_num(avg_recent10)} джк (недавно)")
     lines.append("")
 
-    # Объёмы продаж
-    lines.append("Объёмы продаж")
+    lines.append("*Объёмы продаж*")
     if sold_all <= 0:
         lines.append("— нет данных")
     else:
         lines.append(f"— {_format_num(sold_all)} шт (всё время)")
-        if sold_30 <= 0:
-            lines.append("— нет данных (30 дней)")
-        else:
-            lines.append(f"— {_format_num(sold_30)} шт (30 дней)")
+        lines.append(f"— {_format_num(sold_per_month)} шт (в месяц)")
     lines.append("")
 
-    # Сейчас продаются (сгруппировано по цене)
-    lines.append("Сейчас продаются")
+    lines.append("*Сейчас продаются*")
     if not grouped:
         lines.append("— товар отсутствует")
         return "\n".join(lines)
@@ -312,7 +329,6 @@ def _fetch_rows_dict(sheet_id: str, gid: str) -> List[dict]:
 
 def _ensure_columns(rows: List[dict], required: List[str], table_name: str) -> None:
     if not rows:
-        # пустая таблица — ок, просто нет данных
         return
     fields = set(rows[0].keys())
     missing = [c for c in required if c not in fields]
@@ -396,25 +412,3 @@ def _turnover(sales: List[Tuple[datetime, float, float]]) -> float:
 
 def _sum_qty(sales: List[Tuple[datetime, float, float]]) -> float:
     return sum(q for _, q, _ in sales)
-
-
-def _avg_price_of_cheapest_units(lots: List[Tuple[float, float]], units: int) -> Optional[Tuple[float, float]]:
-    # lots: (price, qty)
-    if not lots:
-        return None
-    lots = sorted(lots, key=lambda x: x[0])
-    remaining = float(units)
-    cost = 0.0
-    taken = 0.0
-    for price, qty in lots:
-        if remaining <= 0:
-            break
-        take = min(qty, remaining)
-        if take <= 0:
-            continue
-        cost += take * price
-        taken += take
-        remaining -= take
-    if taken <= 0:
-        return None
-    return cost / taken, taken
