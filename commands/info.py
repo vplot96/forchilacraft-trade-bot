@@ -45,7 +45,7 @@ async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         q = (arg or "").strip()
         item_id = q if q in id_to_name else name_to_id.get(_normalize(q))
         if not item_id:
-            await update.message.reply_text("Не нашёл товар по вашему запросу. Возможно такой товар не продаётся на бирже.")
+            await update.message.reply_text("Не нашёл товаров по вашему запросу. Возможно этот товар не продаётся на бирже.")
             return
 
         wait_msg = await update.message.reply_text("Собираю актуальную статистику...")
@@ -171,7 +171,7 @@ def build_global_text() -> str:
     lines.append("*Самые дешёвые товары на бирже*")
     if cheapest_items:
         for i, (item_id, min_price, qty_at_min) in enumerate(cheapest_items, 1):
-            lines.append(f"{i}. {name(item_id)}: {_format_num(min_price)} джк ({_format_num(qty_at_min)} шт.)")
+            lines.append(f"{i}. {name(item_id)} ({_format_num(qty_at_min)}) по {_format_num(min_price)} джк")
     else:
         lines.append("— нет данных")
     lines.append("")
@@ -179,7 +179,7 @@ def build_global_text() -> str:
     lines.append("*Самые редкие товары на бирже*")
     if rarest_items:
         for i, (item_id, min_price, stock) in enumerate(rarest_items, 1):
-            lines.append(f"{i}. {name(item_id)}: {_format_num(min_price)} джк ({_format_num(stock)} шт.)")
+            lines.append(f"{i}. {name(item_id)} ({_format_num(stock)}) по {_format_num(min_price)} джк")
     else:
         lines.append("— нет данных")
     lines.append("")
@@ -284,11 +284,11 @@ def build_item_text(item_id: str, item_name: str) -> str:
     if len(price_levels) > TOP_N:
         shown = price_levels[: TOP_N - 1]
         for i, (price, qty_sum) in enumerate(shown, 1):
-            lines.append(f"{i}. {_format_num(price)} джк ({_format_num(qty_sum)} шт)")
+            lines.append(f"{i}. {item_name} ({_format_num(qty_sum)}) по {_format_num(price)} джк")
         lines.append(f"{TOP_N}. ...")
     else:
         for i, (price, qty_sum) in enumerate(price_levels, 1):
-            lines.append(f"{i}. {_format_num(price)} джк ({_format_num(qty_sum)} шт)")
+            lines.append(f"{i}. {item_name} ({_format_num(qty_sum)}) по {_format_num(price)} джк")
 
     return "\n".join(lines)
 
