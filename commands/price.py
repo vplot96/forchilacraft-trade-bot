@@ -122,14 +122,11 @@ def build_price_text(query: str) -> str:
     lines: List[str] = []
 
     lines.append(f'*Цена продажи "{item_name}" (ср.)*')
+
     if avg_all is None:
-        lines.append("— нет данных (всё время)")
+        lines.append("— нет данных")
     else:
         lines.append(f"— {_format_num(avg_all)} джк (всё время)")
-
-    if avg_recent10 is None:
-        lines.append("— нет данных (недавно)")
-    else:
         lines.append(f"— {_format_num(avg_recent10)} джк (недавно)")
 
     lines.append("")  # blank line between blocks
