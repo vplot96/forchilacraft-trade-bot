@@ -1,45 +1,122 @@
-from telegram import Update
-from telegram.ext import ContextTypes
+from __future__ import annotations
 
-# Хелперы заполняются из bot.py
-_load_accounts_rows = None
-_find_account = None
-_parse_balance_to_decimal = None
+import csv
+import io
+import os
+from decimal import Decimal, InvalidOperation
 
-def init_balance_helpers(load_accounts_func, find_account_func, parse_balance_func):
-    global _load_accounts_rows, _find_account, _parse_balance_to_decimal
-    _load_accounts_rows = load_accounts_func
-    _find_account = find_account_func
-    _parse_balance_to_decimal = parse_balance_func
+import httpx
+from aiogram import Router
+from aiogram.filters import Command
+from aiogram.types import Message
 
-async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    username = user.username
-    if not username:
-        await update.message.reply_text("У вас не задан Telegram username (@...).")
-        return
+router = Router()
+
+# =========================
+# Sheet schema (strict)
+# =========================
+COL_USERNAME = "Пользователь"   # Telegram username (@...) or full_name
+COL_BALANCE = "Баланс"          # Numeric balance
+
+
+class BalanceUnavailable(Exception):
+    pass
+
+
+class AccountNotFound(Exception):
+    pass
+
+
+@router.message(Command("balance"))
+async def balance_handler(message: Message) -> None:
+    identity = _get_telegram_identity(message)
+
     try:
-        rows = _load_accounts_rows()
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка доступа к таблице: {e}")
+        balance = await _get_balance(identity)
+    except AccountNotFound:
+        await message.answer("Не удалось найти данные по вашему аккаунту.")
         return
-    acc = _find_account(rows, username)
-    if not acc:
-        await update.message.reply_text(f"Не могу найти аккаунт с именем @{username}.")
+    except BalanceUnavailable:
+        await message.answer("Не удалось получить данные баланса. Попробуйте позже.")
         return
-    bal = _parse_balance_to_decimal(acc.get("Баланс"))
-    await update.message.reply_text(f"Ваш баланс: {bal} джк")
 
-def lookup_price_by_product_name(query: str, cutoff: float = 0.45):
-    if not GID_PRICES:
-        raise RuntimeError("GID_PRICES is not set")
-    rows = fetch_rows(GID_PRICES)
-    qn = normalize(query)
-    names = [normalize(str(r.get("Название товара",""))) for r in rows]
-    import difflib
-    best = difflib.get_close_matches(qn, names, n=1, cutoff=cutoff)
-    if not best:
-        return None
-    idx = names.index(best[0])
-    row = rows[idx]
-    return (str(row.get("Название товара","")).strip(), row.get("Текущая цена",""))
+    if balance == balance.to_integral():
+        value = str(balance.quantize(Decimal("1")))
+    else:
+        value = _format_decimal(balance)
+
+    await message.answer(f"Ваш баланс: {value} джк.")
+
+
+def _get_telegram_identity(message: Message) -> str:
+    user = message.from_user
+    if user and user.username:
+        return f"@{user.username}"
+    return (user.full_name or "").strip()
+
+
+async def _get_balance(identity: str) -> Decimal:
+    rows = await _fetch_accounts_rows()
+
+    if not rows:
+        raise BalanceUnavailable()
+
+    header = rows[0]
+    try:
+        user_idx = header.index(COL_USERNAME)
+        balance_idx = header.index(COL_BALANCE)
+    except ValueError as e:
+        raise BalanceUnavailable() from e
+
+    for row in rows[1:]:
+        if user_idx >= len(row):
+            continue
+
+        if (row[user_idx] or "").strip() != identity:
+            continue
+
+        if balance_idx >= len(row):
+            raise BalanceUnavailable()
+
+        raw = (row[balance_idx] or "").strip()
+        if raw == "":
+            raise BalanceUnavailable()
+
+        try:
+            normalized = raw.replace(" ", "").replace(",", ".")
+            return Decimal(normalized)
+        except InvalidOperation as e:
+            raise BalanceUnavailable() from e
+
+    raise AccountNotFound()
+
+
+async def _fetch_accounts_rows() -> list[list[str]]:
+    sheet_id = os.getenv("SHEET_ID", "").strip()
+    gid = os.getenv("GID_ACCOUNTS", "").strip()
+
+    if not sheet_id or not gid:
+        raise BalanceUnavailable()
+
+    url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export"
+    params = {"format": "csv", "gid": gid}
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.get(url, params=params)
+            response.raise_for_status()
+    except Exception as e:
+        raise BalanceUnavailable() from e
+
+    try:
+        reader = csv.reader(io.StringIO(response.text))
+        return [row for row in reader]
+    except Exception as e:
+        raise BalanceUnavailable() from e
+
+
+def _format_decimal(value: Decimal) -> str:
+    text = format(value, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text
