@@ -4,7 +4,6 @@ import csv
 import logging
 import os
 import re
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from io import StringIO
@@ -67,20 +66,28 @@ def build_price_text(query: str) -> str:
     sales_rows = _fetch_rows_dict(sheet_id, gid_sales)
 
     _ensure_columns(lots_rows, ["Id товара", "Количество", "Цена"], "Лоты")
-    _ensure_columns(sales_rows, ["Отметка времени", "Id товара", "Количество", "Цена"], "Сделки")
+    _ensure_columns(sales_rows, ["Отметка времени", "Id товара", "Количество", "Цена", "Продавец", "Покупатель"], "Сделки")
 
     # ---- sales for this item ----
     sales_item: List[Tuple[datetime, float, float]] = []
     for r in sales_rows:
         if str(r.get("Id товара", "")).strip() != item_id:
             continue
+
         dt = _parse_dt(r.get("Отметка времени"))
         if not dt:
             continue
+
+        seller = str(r.get("Продавец", "")).strip()
+        buyer = str(r.get("Покупатель", "")).strip()
+        if seller and buyer and _normalize(seller) == _normalize(buyer):
+            continue
+
         qty = _to_float(r.get("Количество"))
         price = _to_float(r.get("Цена"))
         if qty <= 0 or price <= 0:
             continue
+
         sales_item.append((dt, qty, price))
 
     avg_all = _weighted_avg(sales_item)
