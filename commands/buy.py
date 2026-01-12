@@ -19,161 +19,245 @@ logger = logging.getLogger(__name__)
 _PENDING_KEY = "pending_buy"
 _cfg: Optional[dict] = None
 
+SHEET_ACCOUNTS_NAME = "Счета"
+SHEET_LOTS_NAME = "Лоты"
 
-# -----------------------------
-# helpers
-# -----------------------------
-def _normalize(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "").strip()).lower()
+# Accounts sheet columns
+ACCOUNTS_COL_USER = "Пользователь"
+ACCOUNTS_COL_LOGIN = "Логин"
+ACCOUNTS_COL_BALANCE = "Баланс"
+
+# Lots sheet columns
+LOTS_COL_DATE = "Дата"
+LOTS_COL_SALE_ID = "Id продажи"
+LOTS_COL_SELLER = "Продавец"
+LOTS_COL_ITEM_ID = "Id товара"
+LOTS_COL_ITEM_NAME = "Товар"
+LOTS_COL_AMOUNT = "Количество"
+LOTS_COL_PRICE = "Цена"
 
 
-def _parse_int(s: str, *, default: int = 0) -> int:
+async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None:
+        return
+
+    cfg = _load_buy_cfg()
+    if not cfg:
+        await update.message.reply_text("Возникла ошибка при использовании команды. Похоже сервис не настроен корректно. Обратитесь к администратору.")
+        return
+
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_text(
+            'Эта команда используется со следующими параметрами:\n'
+            '/buy <название товара> <количество>\n\n'
+            '<название товара> – может быть несколько слов (допустимы опечатки)\n'
+            '<количество> – целое число больше ноля\n\n'
+            'После ввода команды, я сообщу вам стоимость покупки, после чего мне будет необходимо ваше подтверждение. Узнав стоимость, вы можете отменить покупку.'
+            )
+        return
+
+    raw_qty = args[-1]
+    raw_item = " ".join(args[:-1]).strip()
+
+    qty = _parse_int(raw_qty, default=-1)
+    if qty <= 0 or not raw_item:
+        await update.message.reply_text('Введено некорректное количество товара. Ожидается целое число больше ноля.')
+        return
+
+    buyer_user = _tg_user(update)
+
+    await update.message.reply_text("Ищу открытые лоты...")
+
     try:
-        # "10", "10.0" -> 10
-        return int(float(str(s).replace(" ", "").replace(",", ".")))
+        csv_text = await asyncio.to_thread(_fetch_csv_text, cfg["sheet_id"], cfg["gid_open_lots"])
+        all_lots = _parse_open_lots(csv_text)
     except Exception:
-        return default
+        logger.exception("BUY: failed to fetch/parse open_lots")
+        await update.message.reply_text("Возникла ошибка при использовании команды. Похоже что-то не так с базой данных. Обратитесь к администратору.")
+        return
+
+    if not all_lots:
+        await update.message.reply_text("В данный момент на бирже нет товаров.")
+        return
+
+    resolved = _resolve_item_from_lots(all_lots, raw_item)
+    if not resolved:
+        await update.message.reply_text('Не нашёл товар по вашему запросу. Возможно этот товар не продаётся на бирже или название указано неверно.')
+        return
+
+    item_id, item_name = resolved
+    matching = [l for l in all_lots if l.item_id == item_id]
+    if not matching:
+        await update.message.reply_text(f'В данный момент на бирже нет товара "{item_name}".')
+        return
+
+    total_available = sum(max(l.remaining, 0) for l in matching)
+    if total_available < qty:
+        await update.message.reply_text(f'В данный момент по вашему запросу недостаточно товара "{item_name}". Доступное количество: {total_available}.')
+        return
+
+    allocations, total_cost = _split_buy_across_lots(matching, qty)
+    if not allocations:
+        await update.message.reply_text(f'В данный момент на бирже нет товара "{item_name}".')
+        return
+
+    _set_pending(
+        context,
+        {
+            "buyer_user": buyer_user,
+            "item_id": item_id,
+            "item_name": item_name,
+            "qty": qty,
+            "total_cost": total_cost,
+            "allocations": [
+                {
+                    "sale_id": lot.sale_id,
+                    "seller_name": lot.seller_name,
+                    "item_id": lot.item_id,
+                    "qty": take,
+                    "price": lot.price,
+                }
+                for (lot, take) in allocations
+            ],
+        },
+    )
+
+    await update.message.reply_text(
+        f'Покупка {item_name} ({qty}) будет стоить {_fmt_money_human(total_cost)} джк.\n'
+        'Вы подтверждаете покупку? Ответьте "да" или "нет".'
+    )
 
 
-def _parse_money(s: str) -> int:
-    return _parse_int(s, default=0)
+async def buy_confirm_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None:
+        return
 
+    pending = _get_pending(context)
+    if not pending:
+        return
 
-def _csv_export_url(sheet_id: str, gid: str) -> str:
-    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
+    text = (update.message.text or "").strip()
 
+    if _is_no(text):
+        _clear_pending(context)
+        await update.message.reply_text('Покупка отменена.')
+        return
 
-def _fetch_csv_text(sheet_id: str, gid: str) -> str:
-    url = _csv_export_url(sheet_id, gid)
-    r = requests.get(url, timeout=25)
-    r.raise_for_status()
-    # utf-8-sig убирает BOM, если он есть
-    return (r.content or b"").decode("utf-8-sig", errors="replace")
+    if not _is_yes(text):
+        await update.message.reply_text('Мне нужен ответ: "да" или "нет".')
+        return
 
+    cfg = _load_buy_cfg()
+    if not cfg:
+        _clear_pending(context)
+        await update.message.reply_text('Возникла ошибка при использовании команды. Похоже сервис не настроен корректно. Обратитесь к администратору.')
+        return
 
-def _tg_user(update: Update) -> str:
-    u = update.effective_user
-    if u and u.username:
-        return f"@{u.username}"
-    return (u.full_name if u else "unknown").strip()
+    buyer_user = str(pending.get("buyer_user", "")).strip()
+    total_cost = int(pending["total_cost"])
+    item_name = str(pending.get("item_name", "")).strip()
+    qty = int(pending.get("qty", 0))
+    allocations = pending["allocations"]
 
+    try:
+        accounts = await asyncio.to_thread(_fetch_accounts, cfg["sheet_id"], cfg["gid_accounts"])
+    except Exception:
+        logger.exception("BUY: failed to fetch accounts")
+        await update.message.reply_text('Не удалось проверить баланс. Попробуйте позже.')
+        return
 
-@dataclass(frozen=True)
-class OpenLot:
-    ts: str
-    sale_id: str
-    seller_name: str
-    item_id: str
-    item_name: str
-    remaining: int
-    price: int
+    buyer_info = _get_balance_and_login(accounts, buyer_user)
+    if buyer_info is None:
+        _clear_pending(context)
+        await update.message.reply_text('Ваш аккаунт не найден в базе. Возможно ваше имя пользователя было изменено. Обратитесь к администратору.')
+        return
 
+    balance, buyer_login = buyer_info
+    if not buyer_login:
+        _clear_pending(context)
+        await update.message.reply_text('Возникла ошибка в данных вашего аккаунта. Обратитесь к администратору.')
+        return
 
-def _parse_open_lots(csv_text: str) -> List[OpenLot]:
-    reader = csv.DictReader(StringIO(csv_text))
+    if balance < total_cost:
+        _clear_pending(context)
+        await update.message.reply_text(
+            f'Покупка {item_name} ({qty}) будет стоить {_fmt_money_human(total_cost)} джк.\n'
+            f'К сожалению, на вашем счету сейчас {balance} джк — этого не достаточно для совершения операции.\n\n'
+            f'Чтобы узнать стоимость доступных товаров используйте команду /info {item_name}'
+            )
+        return
 
-    required_cols = {
-        "Дата",
-        "Id продажи",
-        "Продавец",
-        "Id товара",
-        "Товар",
-        "Количество",
-        "Цена",
-    }
+    # 1) FORM_BUY
+    buy_form_url = cfg["buy_form_url"]
+    try:
+        for a in allocations:
+            seller_name = str(a.get("seller_name", "")).strip()
 
-    if not required_cols.issubset(reader.fieldnames or []):
-        missing = required_cols - set(reader.fieldnames or [])
-        raise ValueError(f"В таблице 'Лоты' отсутствуют колонки: {', '.join(missing)}")
+            payload = {
+                cfg["buy_entry_sale_id"]: str(a["sale_id"]),
+                cfg["buy_entry_seller"]: seller_name,
+                cfg["buy_entry_buyer"]: str(buyer_login),
+                cfg["buy_entry_item_id"]: str(a["item_id"]),
+                cfg["buy_entry_amount"]: str(int(a["qty"])),
+                cfg["buy_entry_price"]: str(int(a["price"])),
+            }
+            status, preview = await asyncio.to_thread(_submit_trade, buy_form_url, payload)
+            logger.info("BUY: submit(BUY) status=%s preview=%r", status, preview)
+            if not (200 <= status < 400):
+                await update.message.reply_text('Произошла ошибка при совершении покупки. Обратитесь к администратору.')
+                return
+    except Exception:
+        logger.exception("BUY: BUY form submit failed")
+        await update.message.reply_text("Произошла ошибка при совершении покупки. Обратитесь к администратору.")
+        return
 
-    lots: List[OpenLot] = []
+    # 2) FORM_PAY
+    pay_form_url = cfg["pay_form_url"]
+    item_name = str(pending.get("item_name", "")).strip()
 
-    for row in reader:
-        sale_id = str(row["Id продажи"]).strip()
-        if not sale_id:
+    seller_totals: Dict[str, int] = {}
+    for a in allocations:
+        seller_name = str(a.get("seller_name", "")).strip()
+        if not seller_name:
             continue
-
-        lot = OpenLot(
-            ts=str(row["Дата"]).strip(),
-            sale_id=sale_id,
-            seller_name=str(row["Продавец"]).strip(),
-            item_id=str(row["Id товара"]).strip(),
-            item_name=str(row["Товар"]).strip(),
-            remaining=_parse_int(row["Количество"]),
-            price=_parse_money(row["Цена"]),
+        if seller_name == buyer_login:
+            continue  # покупка у себя — перевод не нужен
+        seller_totals[seller_name] = (
+            seller_totals.get(seller_name, 0)
+            + int(a.get("qty", 0)) * int(a.get("price", 0))
         )
 
-        if lot.remaining > 0 and lot.price >= 0:
-            lots.append(lot)
+    if seller_totals:
+        try:
+            for seller_name, seller_sum in seller_totals.items():
+                payload = {
+                    cfg["pay_entry_sender"]: str(buyer_login),
+                    cfg["pay_entry_sender_comment"]: f"Покупка: {item_name} ({seller_sum} джк)",
+                    cfg["pay_entry_recipient"]: str(seller_name),
+                    cfg["pay_entry_recipient_comment"]: f"Продажа: {item_name} ({seller_sum} джк)",
+                    cfg["pay_entry_sum"]: str(int(seller_sum)),
+                }
+                status, preview = await asyncio.to_thread(_submit_trade, pay_form_url, payload)
+                logger.info(
+                    "BUY: submit(PAY) status=%s preview=%r recipient=%s sum=%s",
+                    status,
+                    preview,
+                    seller_name,
+                    seller_sum,
+                )
+                if not (200 <= status < 400):
+                    await update.message.reply_text("Произошла ошибка при переводе средств. Обратитесь к администратору.")
+                    return
+        except Exception:
+            logger.exception("BUY: PAY form submit failed")
+            await update.message.reply_text("Произошла ошибка при переводе средств. Обратитесь к администратору.")
+            return
 
-    return lots
+    _clear_pending(context)
+    await update.message.reply_text("Покупка совершена.")
 
-
-def _resolve_item_from_lots(lots: List[OpenLot], raw_query: str) -> Optional[Tuple[str, str]]:
-    q = _normalize(raw_query)
-    if not q:
-        return None
-
-    seen: Dict[str, str] = {}
-    for l in lots:
-        if l.item_id and l.item_name:
-            seen[l.item_id] = l.item_name
-
-    for item_id, name in seen.items():
-        if _normalize(name) == q:
-            return item_id, name
-
-    from difflib import SequenceMatcher
-
-    best_id = None
-    best_name = None
-    best_ratio = 0.0
-    for item_id, name in seen.items():
-        ratio = SequenceMatcher(None, q, _normalize(name)).ratio()
-        if ratio > best_ratio:
-            best_ratio = ratio
-            best_id = item_id
-            best_name = name
-
-    if best_id is None:
-        return None
-    return best_id, best_name
-
-
-def _split_buy_across_lots(lots: List[OpenLot], need_qty: int) -> Tuple[List[Tuple[OpenLot, int]], int]:
-    sorted_lots = sorted(lots, key=lambda l: (l.price, l.ts))
-    allocations: List[Tuple[OpenLot, int]] = []
-    left = need_qty
-    total_cost = 0
-
-    for lot in sorted_lots:
-        if left <= 0:
-            break
-        take = min(left, max(lot.remaining, 0))
-        if take <= 0:
-            continue
-        allocations.append((lot, take))
-        total_cost += take * lot.price
-        left -= take
-
-    return allocations, total_cost
-
-
-def _fmt_money_human(x: int) -> str:
-    return str(int(x))
-
-
-def _set_pending(context: ContextTypes.DEFAULT_TYPE, payload: dict) -> None:
-    context.user_data[_PENDING_KEY] = payload
-
-
-def _get_pending(context: ContextTypes.DEFAULT_TYPE) -> Optional[dict]:
-    return context.user_data.get(_PENDING_KEY)
-
-
-def _clear_pending(context: ContextTypes.DEFAULT_TYPE) -> None:
-    context.user_data.pop(_PENDING_KEY, None)
-
+# ============================================================
 
 def _load_buy_cfg() -> Optional[dict]:
     global _cfg
@@ -243,131 +327,6 @@ def _load_buy_cfg() -> Optional[dict]:
     return _cfg
 
 
-def _fetch_accounts(sheet_id: str, gid_accounts: str) -> List[dict]:
-    # Ожидаем заголовки: 'Ник', 'Имя пользователя', 'Баланс'.
-    txt = _fetch_csv_text(sheet_id, gid_accounts)
-    reader = csv.DictReader(StringIO(txt))
-    return list(reader)
-
-
-def _find_account_by_nick(accounts: List[dict], nick: str) -> Optional[dict]:
-    n = (nick or "").strip()
-    if not n:
-        return None
-    for row in accounts:
-        if str(row.get("Ник", "")).strip() == n:
-            return row
-    return None
-
-
-def _get_balance_and_game_username(accounts: List[dict], nick: str) -> Optional[Tuple[int, str]]:
-    row = _find_account_by_nick(accounts, nick)
-    if not row:
-        return None
-    balance = _parse_money(row.get("Баланс", "0"))
-    game_username = str(row.get("Имя пользователя", "")).strip()
-    return balance, game_username
-
-
-def _submit_trade(form_url: str, payload: dict) -> Tuple[int, str]:
-    r = requests.post(form_url, data=payload, timeout=25, allow_redirects=False)
-    body_preview = ""
-    try:
-        body_preview = (r.text or "")[:200]
-    except Exception:
-        pass
-    return r.status_code, body_preview
-
-
-# -----------------------------
-# public handlers
-# -----------------------------
-async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message is None:
-        return
-
-    cfg = _load_buy_cfg()
-    if not cfg:
-        await update.message.reply_text("Команда /buy недоступна: не настроены переменные окружения.")
-        return
-
-    args = context.args or []
-    if len(args) < 2:
-        await update.message.reply_text('Использование: /buy <товар> <количество>\nПример: /buy Медный блок 10')
-        return
-
-    raw_qty = args[-1]
-    raw_item = " ".join(args[:-1]).strip()
-
-    qty = _parse_int(raw_qty, default=-1)
-    if qty <= 0 or not raw_item:
-        await update.message.reply_text('Использование: /buy <товар> <количество>\nПример: /buy Медный блок 10')
-        return
-
-    buyer_user = _tg_user(update)
-
-    await update.message.reply_text("Ищу открытые лоты...")
-
-    try:
-        csv_text = await asyncio.to_thread(_fetch_csv_text, cfg["sheet_id"], cfg["gid_open_lots"])
-        all_lots = _parse_open_lots(csv_text)
-    except Exception:
-        logger.exception("BUY: failed to fetch/parse open_lots")
-        await update.message.reply_text("Не удалось прочитать таблицу лотов. Попробуйте позже.")
-        return
-
-    if not all_lots:
-        await update.message.reply_text("Открытых лотов сейчас нет.")
-        return
-
-    resolved = _resolve_item_from_lots(all_lots, raw_item)
-    if not resolved:
-        await update.message.reply_text(f'Не нашёл товар по запросу: "{raw_item}". Проверьте название.')
-        return
-
-    item_id, item_name = resolved
-    matching = [l for l in all_lots if l.item_id == item_id]
-    if not matching:
-        await update.message.reply_text(f'Нет доступных лотов для: "{item_name}".')
-        return
-
-    total_available = sum(max(l.remaining, 0) for l in matching)
-    if total_available < qty:
-        await update.message.reply_text(f'Недостаточно товара "{item_name}". Доступно: {total_available}.')
-        return
-
-    allocations, total_cost = _split_buy_across_lots(matching, qty)
-    if not allocations:
-        await update.message.reply_text(f'Нет доступных лотов для: "{item_name}".')
-        return
-
-    _set_pending(
-        context,
-        {
-            "buyer_user": buyer_user,
-            "item_id": item_id,
-            "item_name": item_name,
-            "qty": qty,
-            "total_cost": total_cost,
-            "allocations": [
-                {
-                    "sale_id": lot.sale_id,
-                    "seller_name": lot.seller_name,
-                    "item_id": lot.item_id,
-                    "qty": take,
-                    "price": lot.price,
-                }
-                for (lot, take) in allocations
-            ],
-        },
-    )
-
-    await update.message.reply_text(
-        f'Покупка {item_name} ({qty}) будет стоить {_fmt_money_human(total_cost)} джк.\n'
-        'Вы подтверждаете покупку? Ответьте "да" или "нет".'
-    )
-
-
 def _is_yes(text: str) -> bool:
     t = _normalize(text)
     return t in {"да", "yes", "y", "ага", "ок", "окей"}
@@ -378,117 +337,185 @@ def _is_no(text: str) -> bool:
     return t in {"нет", "no", "n", "не", "неа"}
 
 
-async def buy_confirm_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message is None:
-        return
+def _set_pending(context: ContextTypes.DEFAULT_TYPE, payload: dict) -> None:
+    context.user_data[_PENDING_KEY] = payload
 
-    pending = _get_pending(context)
-    if not pending:
-        return
 
-    text = (update.message.text or "").strip()
+def _get_pending(context: ContextTypes.DEFAULT_TYPE) -> Optional[dict]:
+    return context.user_data.get(_PENDING_KEY)
 
-    if _is_no(text):
-        _clear_pending(context)
-        await update.message.reply_text("Покупка отменена.")
-        return
 
-    if not _is_yes(text):
-        await update.message.reply_text('Мне нужен чёткий ответ: "да" или "нет".')
-        return
+def _clear_pending(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop(_PENDING_KEY, None)
 
-    cfg = _load_buy_cfg()
-    if not cfg:
-        _clear_pending(context)
-        await update.message.reply_text("Команда /buy недоступна: не настроены переменные окружения.")
-        return
 
-    buyer_user = str(pending.get("buyer_user", "")).strip()
-    total_cost = int(pending["total_cost"])
-    allocations = pending["allocations"]
+def _tg_user(update: Update) -> str:
+    u = update.effective_user
+    if u and u.username:
+        return f"@{u.username}"
+    return (u.full_name if u else "unknown").strip()
 
+
+def _normalize(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip()).lower()
+
+
+def _parse_int(s: str, *, default: int = 0) -> int:
     try:
-        accounts = await asyncio.to_thread(_fetch_accounts, cfg["sheet_id"], cfg["gid_accounts"])
+        return int(float(str(s).replace(" ", "").replace(",", ".")))
     except Exception:
-        logger.exception("BUY: failed to fetch accounts")
-        await update.message.reply_text("Не удалось проверить баланс. Попробуйте позже.")
-        return
+        return default
 
-    buyer_info = _get_balance_and_game_username(accounts, buyer_user)
-    if buyer_info is None:
-        _clear_pending(context)
-        await update.message.reply_text(
-            "Не удалось найти ваш ник в таблице 'Счета'.\n"
-            f"Ожидался ник: {buyer_user}"
+
+def _parse_money(s: str) -> int:
+    return _parse_int(s, default=0)
+
+
+def _fmt_money_human(x: int) -> str:
+    return str(int(x))
+
+
+def _csv_export_url(sheet_id: str, gid: str) -> str:
+    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
+
+
+def _fetch_csv_text(sheet_id: str, gid: str) -> str:
+    url = _csv_export_url(sheet_id, gid)
+    r = requests.get(url, timeout=25)
+    r.raise_for_status()
+    return (r.content or b"").decode("utf-8-sig", errors="replace")
+
+
+def _fetch_accounts(sheet_id: str, gid_accounts: str) -> List[dict]:
+    txt = _fetch_csv_text(sheet_id, gid_accounts)
+    reader = csv.DictReader(StringIO(txt))
+    return list(reader)
+
+
+def _find_account_by_user(accounts: List[dict], tg_user: str) -> Optional[dict]:
+    u = (tg_user or "").strip()
+    if not u:
+        return None
+    for row in accounts:
+        if str(row.get(ACCOUNTS_COL_USER, "")).strip() == u:
+            return row
+    return None
+
+
+def _get_balance_and_login(accounts: List[dict], tg_user: str) -> Optional[Tuple[int, str]]:
+    row = _find_account_by_user(accounts, tg_user)
+    if not row:
+        return None
+    balance = _parse_money(row.get(ACCOUNTS_COL_BALANCE, "0"))
+    login = str(row.get(ACCOUNTS_COL_LOGIN, "")).strip()
+    return balance, login
+
+
+@dataclass(frozen=True)
+class OpenLot:
+    ts: str
+    sale_id: str
+    seller_name: str
+    item_id: str
+    item_name: str
+    remaining: int
+    price: int
+
+
+def _parse_open_lots(csv_text: str) -> List[OpenLot]:
+    reader = csv.DictReader(StringIO(csv_text))
+
+    required_cols = {
+        LOTS_COL_DATE,
+        LOTS_COL_SALE_ID,
+        LOTS_COL_SELLER,
+        LOTS_COL_ITEM_ID,
+        LOTS_COL_ITEM_NAME,
+        LOTS_COL_AMOUNT,
+        LOTS_COL_PRICE,
+    }
+
+    if not required_cols.issubset(reader.fieldnames or []):
+        missing = required_cols - set(reader.fieldnames or [])
+        raise ValueError(f"В таблице '{SHEET_LOTS_NAME}' отсутствуют колонки: {', '.join(sorted(missing))}")
+
+    lots: List[OpenLot] = []
+    for row in reader:
+        sale_id = str(row[LOTS_COL_SALE_ID]).strip()
+        if not sale_id:
+            continue
+
+        lot = OpenLot(
+            ts=str(row[LOTS_COL_DATE]).strip(),
+            sale_id=sale_id,
+            seller_name=str(row[LOTS_COL_SELLER]).strip(),
+            item_id=str(row[LOTS_COL_ITEM_ID]).strip(),
+            item_name=str(row[LOTS_COL_ITEM_NAME]).strip(),
+            remaining=_parse_int(row[LOTS_COL_AMOUNT]),
+            price=_parse_money(row[LOTS_COL_PRICE]),
         )
-        return
 
-    balance, buyer_name = buyer_info
-    if not buyer_name:
-        _clear_pending(context)
-        await update.message.reply_text("В таблице 'Счета' у вашего ника не заполнено поле 'Имя пользователя'.")
-        return
+        if lot.remaining > 0 and lot.price >= 0:
+            lots.append(lot)
 
-    if balance < total_cost:
-        _clear_pending(context)
-        await update.message.reply_text(f"Недостаточно средств. Нужно {total_cost} джк, у вас {balance} джк.")
-        return
+    return lots
 
-    buy_form_url = cfg["buy_form_url"]
+
+def _resolve_item_from_lots(lots: List[OpenLot], raw_query: str) -> Optional[Tuple[str, str]]:
+    q = _normalize(raw_query)
+    if not q:
+        return None
+
+    seen: Dict[str, str] = {}
+    for l in lots:
+        if l.item_id and l.item_name:
+            seen[l.item_id] = l.item_name
+
+    for item_id, name in seen.items():
+        if _normalize(name) == q:
+            return item_id, name
+
+    from difflib import SequenceMatcher
+
+    best_id = None
+    best_name = None
+    best_ratio = 0.0
+    for item_id, name in seen.items():
+        ratio = SequenceMatcher(None, q, _normalize(name)).ratio()
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_id = item_id
+            best_name = name
+
+    if best_id is None:
+        return None
+    return best_id, best_name
+
+
+def _split_buy_across_lots(lots: List[OpenLot], need_qty: int) -> Tuple[List[Tuple[OpenLot, int]], int]:
+    sorted_lots = sorted(lots, key=lambda l: (l.price, l.ts))
+    allocations: List[Tuple[OpenLot, int]] = []
+    left = need_qty
+    total_cost = 0
+
+    for lot in sorted_lots:
+        if left <= 0:
+            break
+        take = min(left, max(lot.remaining, 0))
+        if take <= 0:
+            continue
+        allocations.append((lot, take))
+        total_cost += take * lot.price
+        left -= take
+
+    return allocations, total_cost
+
+
+def _submit_trade(form_url: str, payload: dict) -> Tuple[int, str]:
+    r = requests.post(form_url, data=payload, timeout=25, allow_redirects=False)
+    body_preview = ""
     try:
-        for a in allocations:
-            seller_name = str(a.get("seller_name", "")).strip()
-
-            payload = {
-                cfg["buy_entry_sale_id"]: str(a["sale_id"]),
-                cfg["buy_entry_seller"]: seller_name,
-                cfg["buy_entry_buyer"]: str(buyer_name),
-                cfg["buy_entry_item_id"]: str(a["item_id"]),
-                cfg["buy_entry_amount"]: str(int(a["qty"])),
-                cfg["buy_entry_price"]: str(int(a["price"])),
-            }
-            status, preview = await asyncio.to_thread(_submit_trade, buy_form_url, payload)
-            logger.info("BUY: submit(BUY) status=%s preview=%r", status, preview)
-            if not (200 <= status < 400):
-                await update.message.reply_text("Не удалось отправить покупку (Google Forms). Попробуйте позже.")
-                return
+        body_preview = (r.text or "")[:200]
     except Exception:
-        logger.exception("BUY: BUY form submit failed")
-        await update.message.reply_text("Не удалось отправить покупку (Google Forms). Попробуйте позже.")
-        return
-
-    pay_form_url = cfg["pay_form_url"]
-    item_name = str(pending.get("item_name", "")).strip()
-
-    seller_totals: Dict[str, int] = {}
-    for a in allocations:
-        seller_name = str(a.get("seller_name", "")).strip()
-        seller_totals[seller_name] = seller_totals.get(seller_name, 0) + int(a.get("qty", 0)) * int(a.get("price", 0))
-
-    try:
-        for seller_name, seller_sum in seller_totals.items():
-            payload = {
-                cfg["pay_entry_sender"]: str(buyer_name),
-                cfg["pay_entry_sender_comment"]: f"Покупка: {item_name} ({seller_sum} джк)",
-                cfg["pay_entry_recipient"]: str(seller_name),
-                cfg["pay_entry_recipient_comment"]: f"Продажа: {item_name} ({seller_sum} джк)",
-                cfg["pay_entry_sum"]: str(int(seller_sum)),
-            }
-            status, preview = await asyncio.to_thread(_submit_trade, pay_form_url, payload)
-            logger.info(
-                "BUY: submit(PAY) status=%s preview=%r recipient=%s sum=%s",
-                status,
-                preview,
-                seller_name,
-                seller_sum,
-            )
-            if not (200 <= status < 400):
-                await update.message.reply_text("Не удалось отправить переводы (Google Forms). Попробуйте позже.")
-                return
-    except Exception:
-        logger.exception("BUY: PAY form submit failed")
-        await update.message.reply_text("Не удалось отправить переводы (Google Forms). Попробуйте позже.")
-        return
-
-    _clear_pending(context)
-    await update.message.reply_text("Покупка отправлена.")
+        pass
+    return r.status_code, body_preview
