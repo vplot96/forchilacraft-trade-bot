@@ -3,7 +3,7 @@ import io
 import os
 from decimal import Decimal, InvalidOperation
 
-import aiohttp
+import httpx
 
 
 COL_TELEGRAM_USER = "Пользователь"
@@ -11,24 +11,29 @@ COL_GAME_LOGIN = "Логин"
 COL_BALANCE = "Баланс"
 
 
-async def balance_handler(message) -> None:
-    identity = _telegram_identity(message)
+async def balance(update, context) -> None:
+    message = getattr(update, "effective_message", None)
+    user = getattr(update, "effective_user", None)
+
+    identity = _telegram_identity(user)
 
     try:
-        balance = await _get_balance(identity)
+        value = await _get_balance(identity)
     except Exception:
-        await message.answer("Не удалось получить данные баланса. Попробуйте позже.")
+        if message:
+            await message.reply_text("Не удалось получить данные баланса. Попробуйте позже.")
         return
 
-    if balance is None:
-        await message.answer("Не удалось найти данные по вашему аккаунту.")
+    if value is None:
+        if message:
+            await message.reply_text("Не удалось найти данные по вашему аккаунту.")
         return
 
-    await message.answer(f"Ваш баланс: {_format_decimal(balance)} монет.")
+    if message:
+        await message.reply_text(f"Ваш баланс: {_format_decimal(value)} джк.")
 
 
-def _telegram_identity(message) -> str:
-    user = getattr(message, "from_user", None)
+def _telegram_identity(user) -> str:
     username = getattr(user, "username", None)
     if username:
         return f"@{username}"
@@ -44,7 +49,7 @@ async def _get_balance(identity: str) -> Decimal | None:
 
     header = rows[0]
     user_idx = header.index(COL_TELEGRAM_USER)
-    balance_idx = header.index(COL_BALANCE)
+    bal_idx = header.index(COL_BALANCE)
 
     for row in rows[1:]:
         if user_idx >= len(row):
@@ -53,10 +58,10 @@ async def _get_balance(identity: str) -> Decimal | None:
         if (row[user_idx] or "").strip() != identity:
             continue
 
-        if balance_idx >= len(row):
+        if bal_idx >= len(row):
             raise RuntimeError
 
-        raw = (row[balance_idx] or "").strip()
+        raw = (row[bal_idx] or "").strip()
         if raw == "":
             raise RuntimeError
 
@@ -78,12 +83,11 @@ async def _fetch_accounts_rows() -> list[list[str]]:
     url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export"
     params = {"format": "csv", "gid": gid}
 
-    timeout = aiohttp.ClientTimeout(total=10)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(url, params=params) as resp:
-            if resp.status != 200:
-                raise RuntimeError
-            text = await resp.text()
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(url, params=params)
+        if resp.status_code != 200:
+            raise RuntimeError
+        text = resp.text
 
     return list(csv.reader(io.StringIO(text)))
 
