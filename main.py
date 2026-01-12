@@ -47,46 +47,9 @@ def optional_env(name: str) -> str | None:
     return v if v else None
 
 BOT_TOKEN = require_env("BOT_TOKEN")
-SHEET_ID = require_env("SHEET_ID")
-GID_ACCOUNTS = require_env("GID_ACCOUNTS")
-
-GID_PRICES = optional_env("GID_PRICES")
-GID_OPS = optional_env("GID_OPS")
-
-def normalize(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "").strip()).lower()
-
-def csv_url_for(gid: str) -> str:
-    return f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid={gid}"
-
-def fetch_rows(gid: str):
-    r = requests.get(csv_url_for(gid), timeout=20)
-    r.raise_for_status()
-    reader = csv.DictReader(StringIO(r.content.decode("utf-8-sig")))
-    return list(reader)
-
-def _parse_decimal(value) -> Decimal:
-    s = str(value or "").strip().replace(" ", "").replace(",", ".")
-    try:
-        return Decimal(s)
-    except Exception:
-        return Decimal("0")
-
-def _parse_balance_to_decimal(value) -> Decimal:
-    return _parse_decimal(value).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-
-def _find_account(rows, username: str):
-    u = normalize(username)
-    for r in rows:
-        if normalize(str(r.get("Username", ""))) == u:
-            return r
-    return None
-
-def _load_accounts_rows():
-    return fetch_rows(GID_ACCOUNTS)
 
 from commands.help import help_cmd
-from commands.balance import balance, init_balance_helpers
+from commands.balance import balance
 from commands.price import price
 from commands.pay import pay as pay_cmd, init_pay_helpers
 from commands.ops import ops, init_ops_helpers
@@ -97,7 +60,6 @@ from commands.info import info
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Готов к работе! Введите /help для вывода списка команд.")
 
-init_balance_helpers(_load_accounts_rows, _find_account, _parse_balance_to_decimal)
 
 def _clear_pending_all(context: ContextTypes.DEFAULT_TYPE):
     for k in list(context.user_data.keys()):
