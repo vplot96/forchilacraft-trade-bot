@@ -13,9 +13,9 @@ from telegram.ext import ContextTypes
 
 logger = logging.getLogger(__name__)
 
-
-COL_TELEGRAM_USER = "Пользователь"
-COL_GAME_LOGIN = "Логин"
+ACCOUNTS_SHEET = "Счета"
+COL_USERNAME = "Пользователь"
+COL_LOGIN = "Логин"
 COL_BALANCE = "Баланс"
 
 
@@ -32,11 +32,11 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Не удалось найти данные по вашему аккаунту.")
             return
 
-        await update.message.reply_text(f"Ваш баланс: {_format_decimal(value)} монет.")
+        await update.message.reply_text(f"Ваш баланс: {_format_decimal(value)} джк.")
 
     except Exception:
         logger.exception("BALANCE command failed")
-        await update.message.reply_text("Не удалось получить данные баланса. Попробуйте позже.")
+        await update.message.reply_text("Не удалось получить данные баланса. Уточните ваши данные.")
 
 
 def build_balance_value(identity: str) -> Optional[Decimal]:
@@ -47,10 +47,10 @@ def build_balance_value(identity: str) -> Optional[Decimal]:
     if not rows:
         return None
 
-    _ensure_columns(rows, [COL_TELEGRAM_USER, COL_BALANCE], "Счета")
+    _ensure_columns(rows, [COL_USERNAME, COL_BALANCE], ACCOUNTS_SHEET)
 
     for r in rows:
-        if str(r.get(COL_TELEGRAM_USER, "")).strip() != identity:
+        if str(r.get(COL_USERNAME, "")).strip() != identity:
             continue
 
         raw = str(r.get(COL_BALANCE, "")).strip()
