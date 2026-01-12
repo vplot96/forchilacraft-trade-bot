@@ -1,72 +1,50 @@
-from __future__ import annotations
-
 import csv
 import io
 import os
 from decimal import Decimal, InvalidOperation
 
-import httpx
-from aiogram import Router
-from aiogram.filters import Command
-from aiogram.types import Message
-
-router = Router()
-
-# =========================
-# Sheet schema (strict)
-# =========================
-COL_USERNAME = "Пользователь"   # Telegram username (@...) or full_name
-COL_BALANCE = "Баланс"          # Numeric balance
+import aiohttp
 
 
-class BalanceUnavailable(Exception):
-    pass
+COL_TELEGRAM_USER = "Пользователь"
+COL_GAME_LOGIN = "Логин"
+COL_BALANCE = "Баланс"
 
 
-class AccountNotFound(Exception):
-    pass
-
-
-@router.message(Command("balance"))
-async def balance_handler(message: Message) -> None:
-    identity = _get_telegram_identity(message)
+async def balance_handler(message) -> None:
+    identity = _telegram_identity(message)
 
     try:
         balance = await _get_balance(identity)
-    except AccountNotFound:
-        await message.answer("Не удалось найти данные по вашему аккаунту.")
-        return
-    except BalanceUnavailable:
+    except Exception:
         await message.answer("Не удалось получить данные баланса. Попробуйте позже.")
         return
 
-    if balance == balance.to_integral():
-        value = str(balance.quantize(Decimal("1")))
-    else:
-        value = _format_decimal(balance)
+    if balance is None:
+        await message.answer("Не удалось найти данные по вашему аккаунту.")
+        return
 
-    await message.answer(f"Ваш баланс: {value} джк.")
-
-
-def _get_telegram_identity(message: Message) -> str:
-    user = message.from_user
-    if user and user.username:
-        return f"@{user.username}"
-    return (user.full_name or "").strip()
+    await message.answer(f"Ваш баланс: {_format_decimal(balance)} монет.")
 
 
-async def _get_balance(identity: str) -> Decimal:
+def _telegram_identity(message) -> str:
+    user = getattr(message, "from_user", None)
+    username = getattr(user, "username", None)
+    if username:
+        return f"@{username}"
+
+    full_name = getattr(user, "full_name", "") or ""
+    return full_name.strip()
+
+
+async def _get_balance(identity: str) -> Decimal | None:
     rows = await _fetch_accounts_rows()
-
     if not rows:
-        raise BalanceUnavailable()
+        raise RuntimeError
 
     header = rows[0]
-    try:
-        user_idx = header.index(COL_USERNAME)
-        balance_idx = header.index(COL_BALANCE)
-    except ValueError as e:
-        raise BalanceUnavailable() from e
+    user_idx = header.index(COL_TELEGRAM_USER)
+    balance_idx = header.index(COL_BALANCE)
 
     for row in rows[1:]:
         if user_idx >= len(row):
@@ -76,47 +54,45 @@ async def _get_balance(identity: str) -> Decimal:
             continue
 
         if balance_idx >= len(row):
-            raise BalanceUnavailable()
+            raise RuntimeError
 
         raw = (row[balance_idx] or "").strip()
         if raw == "":
-            raise BalanceUnavailable()
+            raise RuntimeError
 
         try:
             normalized = raw.replace(" ", "").replace(",", ".")
             return Decimal(normalized)
-        except InvalidOperation as e:
-            raise BalanceUnavailable() from e
+        except InvalidOperation:
+            raise RuntimeError
 
-    raise AccountNotFound()
+    return None
 
 
 async def _fetch_accounts_rows() -> list[list[str]]:
     sheet_id = os.getenv("SHEET_ID", "").strip()
     gid = os.getenv("GID_ACCOUNTS", "").strip()
-
     if not sheet_id or not gid:
-        raise BalanceUnavailable()
+        raise RuntimeError
 
     url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export"
     params = {"format": "csv", "gid": gid}
 
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            response = await client.get(url, params=params)
-            response.raise_for_status()
-    except Exception as e:
-        raise BalanceUnavailable() from e
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(url, params=params) as resp:
+            if resp.status != 200:
+                raise RuntimeError
+            text = await resp.text()
 
-    try:
-        reader = csv.reader(io.StringIO(response.text))
-        return [row for row in reader]
-    except Exception as e:
-        raise BalanceUnavailable() from e
+    return list(csv.reader(io.StringIO(text)))
 
 
 def _format_decimal(value: Decimal) -> str:
-    text = format(value, "f")
-    if "." in text:
-        text = text.rstrip("0").rstrip(".")
-    return text
+    if value == value.to_integral():
+        return str(value.quantize(Decimal("1")))
+
+    s = format(value, "f")
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s
