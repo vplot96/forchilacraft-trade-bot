@@ -57,11 +57,11 @@ async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    raw_qty = args[-1]
+    raw_amount = args[-1]
     raw_item = " ".join(args[:-1]).strip()
 
-    qty = _parse_int(raw_qty, default=-1)
-    if qty <= 0 or not raw_item:
+    amount = _parse_int(raw_amount, default=-1)
+    if amount <= 0 or not raw_item:
         await update.message.reply_text('Введено некорректное количество товара. Ожидается целое число больше ноля.')
         return
 
@@ -93,29 +93,54 @@ async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     total_available = sum(max(l.remaining, 0) for l in matching)
-    if total_available < qty:
+    if total_available < amount:
         await update.message.reply_text(f'В данный момент по вашему запросу недостаточно товара "{item_name}". Доступное количество: {total_available}.')
         return
 
-    allocations, total_cost = _split_buy_across_lots(matching, qty)
+    allocations, total_cost = _split_buy_across_lots(matching, amount)
     if not allocations:
         await update.message.reply_text(f'В данный момент на бирже нет товара "{item_name}".')
+        return
+
+    try:
+        accounts = await asyncio.to_thread(_fetch_accounts, cfg["sheet_id"], cfg["gid_accounts"])
+    except Exception:
+        logger.exception("BUY: failed to fetch accounts")
+        await update.message.reply_text("Не удалось проверить баланс. Попробуйте позже.")
+        return
+
+    buyer_info = _get_balance_and_login(accounts, buyer_user)
+    if buyer_info is None:
+        await update.message.reply_text('Ваш аккаунт не найден в базе. Возможно ваше имя пользователя было изменено. Обратитесь к администратору.')
+        return
+
+    balance, buyer_login = buyer_info
+    if not buyer_login:
+        await update.message.reply_text('Возникла ошибка в данных вашего аккаунта. Обратитесь к администратору.')
+        return
+
+    if balance < total_cost:
+        await update.message.reply_text(
+            f'Покупка {item_name} ({amount}) будет стоить {_fmt_money_human(total_cost)} джк.\n'
+            f'К сожалению, на вашем счету сейчас {balance} джк — этого не достаточно для совершения операции.\n\n'
+            f'Чтобы узнать стоимость доступных товаров используйте команду /info {item_name}'
+        )
         return
 
     _set_pending(
         context,
         {
-            "buyer_user": buyer_user,
+            "buyer_login": buyer_login,
             "item_id": item_id,
             "item_name": item_name,
-            "qty": qty,
+            "amount": amount,
             "total_cost": total_cost,
             "allocations": [
                 {
                     "sale_id": lot.sale_id,
-                    "seller_name": lot.seller_name,
+                    "seller_login": lot.seller_login,
                     "item_id": lot.item_id,
-                    "qty": take,
+                    "amount": take,
                     "price": lot.price,
                 }
                 for (lot, take) in allocations
@@ -124,7 +149,7 @@ async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     await update.message.reply_text(
-        f'Покупка {item_name} ({qty}) будет стоить {_fmt_money_human(total_cost)} джк.\n'
+        f'Покупка {item_name} ({amount}) будет стоить {_fmt_money_human(total_cost)} джк.\n'
         'Вы подтверждаете покупку? Ответьте "да" или "нет".'
     )
 
@@ -154,62 +179,50 @@ async def buy_confirm_listener(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text('Возникла ошибка при использовании команды. Похоже сервис не настроен корректно. Обратитесь к администратору.')
         return
 
-    buyer_user = str(pending.get("buyer_user", "")).strip()
-    total_cost = int(pending["total_cost"])
-    item_name = str(pending.get("item_name", "")).strip()
-    qty = int(pending.get("qty", 0))
+    buyer_login = str(pending.get("buyer_login", "")).strip()
     allocations = pending["allocations"]
 
     try:
-        accounts = await asyncio.to_thread(_fetch_accounts, cfg["sheet_id"], cfg["gid_accounts"])
+        ok = await asyncio.to_thread(_pending_allocations_still_available, cfg, pending)
     except Exception:
-        logger.exception("BUY: failed to fetch accounts")
-        await update.message.reply_text('Не удалось проверить баланс. Попробуйте позже.')
-        return
-
-    buyer_info = _get_balance_and_login(accounts, buyer_user)
-    if buyer_info is None:
-        _clear_pending(context)
-        await update.message.reply_text('Ваш аккаунт не найден в базе. Возможно ваше имя пользователя было изменено. Обратитесь к администратору.')
-        return
-
-    balance, buyer_login = buyer_info
-    if not buyer_login:
-        _clear_pending(context)
-        await update.message.reply_text('Возникла ошибка в данных вашего аккаунта. Обратитесь к администратору.')
-        return
-
-    if balance < total_cost:
+        logger.exception("BUY: failed to re-check lots before confirm")
         _clear_pending(context)
         await update.message.reply_text(
-            f'Покупка {item_name} ({qty}) будет стоить {_fmt_money_human(total_cost)} джк.\n'
-            f'К сожалению, на вашем счету сейчас {balance} джк — этого не достаточно для совершения операции.\n\n'
-            f'Чтобы узнать стоимость доступных товаров используйте команду /info {item_name}'
-            )
+            "При отправке покупки возникла ошибка. Похоже что-то не так с открытыми лотами. Попробуйте ещё раз или обратитесь к администратору."
+        )
+        return
+
+    if not ok:
+        _clear_pending(context)
+        await update.message.reply_text(
+            "Похоже кто-то успел приобрести этот товар раньше вас. Попробуйте совершить покупку ещё раз."
+        )
         return
 
     # 1) FORM_BUY
     buy_form_url = cfg["buy_form_url"]
     try:
         for a in allocations:
-            seller_name = str(a.get("seller_name", "")).strip()
+            seller_login = str(a.get("seller_login", "")).strip()
 
             payload = {
                 cfg["buy_entry_sale_id"]: str(a["sale_id"]),
-                cfg["buy_entry_seller"]: seller_name,
+                cfg["buy_entry_seller"]: seller_login,
                 cfg["buy_entry_buyer"]: str(buyer_login),
                 cfg["buy_entry_item_id"]: str(a["item_id"]),
-                cfg["buy_entry_amount"]: str(int(a["qty"])),
+                cfg["buy_entry_amount"]: str(int(a["amount"])),
                 cfg["buy_entry_price"]: str(int(a["price"])),
             }
             status, preview = await asyncio.to_thread(_submit_trade, buy_form_url, payload)
             logger.info("BUY: submit(BUY) status=%s preview=%r", status, preview)
             if not (200 <= status < 400):
+                _clear_pending(context)
                 await update.message.reply_text('Произошла ошибка при совершении покупки. Обратитесь к администратору.')
                 return
     except Exception:
         logger.exception("BUY: BUY form submit failed")
         await update.message.reply_text("Произошла ошибка при совершении покупки. Обратитесь к администратору.")
+        _clear_pending(context)
         return
 
     # 2) FORM_PAY
@@ -218,23 +231,23 @@ async def buy_confirm_listener(update: Update, context: ContextTypes.DEFAULT_TYP
 
     seller_totals: Dict[str, int] = {}
     for a in allocations:
-        seller_name = str(a.get("seller_name", "")).strip()
-        if not seller_name:
+        seller_login = str(a.get("seller_login", "")).strip()
+        if not seller_login:
             continue
-        if seller_name == buyer_login:
-            continue  # покупка у себя — перевод не нужен
-        seller_totals[seller_name] = (
-            seller_totals.get(seller_name, 0)
-            + int(a.get("qty", 0)) * int(a.get("price", 0))
+        if seller_login == buyer_login:
+            continue
+        seller_totals[seller_login] = (
+            seller_totals.get(seller_login, 0)
+            + int(a.get("amount", 0)) * int(a.get("price", 0))
         )
 
     if seller_totals:
         try:
-            for seller_name, seller_sum in seller_totals.items():
+            for seller_login, seller_sum in seller_totals.items():
                 payload = {
                     cfg["pay_entry_sender"]: str(buyer_login),
                     cfg["pay_entry_sender_comment"]: f"Покупка: {item_name} ({seller_sum} джк)",
-                    cfg["pay_entry_recipient"]: str(seller_name),
+                    cfg["pay_entry_recipient"]: str(seller_login),
                     cfg["pay_entry_recipient_comment"]: f"Продажа: {item_name} ({seller_sum} джк)",
                     cfg["pay_entry_sum"]: str(int(seller_sum)),
                 }
@@ -243,15 +256,17 @@ async def buy_confirm_listener(update: Update, context: ContextTypes.DEFAULT_TYP
                     "BUY: submit(PAY) status=%s preview=%r recipient=%s sum=%s",
                     status,
                     preview,
-                    seller_name,
+                    seller_login,
                     seller_sum,
                 )
                 if not (200 <= status < 400):
+                    _clear_pending(context)
                     await update.message.reply_text("Произошла ошибка при переводе средств. Обратитесь к администратору.")
                     return
         except Exception:
             logger.exception("BUY: PAY form submit failed")
             await update.message.reply_text("Произошла ошибка при переводе средств. Обратитесь к администратору.")
+            _clear_pending(context)
             return
 
     _clear_pending(context)
@@ -415,7 +430,7 @@ def _get_balance_and_login(accounts: List[dict], tg_user: str) -> Optional[Tuple
 class OpenLot:
     ts: str
     sale_id: str
-    seller_name: str
+    seller_login: str
     item_id: str
     item_name: str
     remaining: int
@@ -448,7 +463,7 @@ def _parse_open_lots(csv_text: str) -> List[OpenLot]:
         lot = OpenLot(
             ts=str(row[LOTS_COL_DATE]).strip(),
             sale_id=sale_id,
-            seller_name=str(row[LOTS_COL_SELLER]).strip(),
+            seller_login=str(row[LOTS_COL_SELLER]).strip(),
             item_id=str(row[LOTS_COL_ITEM_ID]).strip(),
             item_name=str(row[LOTS_COL_ITEM_NAME]).strip(),
             remaining=_parse_int(row[LOTS_COL_AMOUNT]),
@@ -492,10 +507,10 @@ def _resolve_item_from_lots(lots: List[OpenLot], raw_query: str) -> Optional[Tup
     return best_id, best_name
 
 
-def _split_buy_across_lots(lots: List[OpenLot], need_qty: int) -> Tuple[List[Tuple[OpenLot, int]], int]:
+def _split_buy_across_lots(lots: List[OpenLot], need_amount: int) -> Tuple[List[Tuple[OpenLot, int]], int]:
     sorted_lots = sorted(lots, key=lambda l: (l.price, l.ts))
     allocations: List[Tuple[OpenLot, int]] = []
-    left = need_qty
+    left = need_amount
     total_cost = 0
 
     for lot in sorted_lots:
@@ -519,3 +534,33 @@ def _submit_trade(form_url: str, payload: dict) -> Tuple[int, str]:
     except Exception:
         pass
     return r.status_code, body_preview
+
+
+def _pending_allocations_still_available(cfg: dict, pending: dict) -> bool:
+    csv_text = _fetch_csv_text(cfg["sheet_id"], cfg["gid_open_lots"])
+    lots_now = _parse_open_lots(csv_text)
+
+    lots_by_sale_id: Dict[str, OpenLot] = {l.sale_id: l for l in lots_now}
+
+    allocations = pending.get("allocations") or []
+    for a in allocations:
+        sale_id = str(a.get("sale_id", "")).strip()
+        if not sale_id:
+            return False
+
+        lot = lots_by_sale_id.get(sale_id)
+        if lot is None:
+            return False
+
+        if str(a.get("item_id", "")).strip() != lot.item_id:
+            return False
+        if str(a.get("seller_login", "")).strip() != lot.seller_login:
+            return False
+        if int(a.get("price", -1)) != lot.price:
+            return False
+
+        need_amount = int(a.get("amount", 0))
+        if lot.remaining < need_amount:
+            return False
+
+    return True
