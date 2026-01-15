@@ -55,6 +55,7 @@ from commands.pay import pay as pay_cmd, init_pay_helpers
 from commands.ops import ops, init_ops_helpers
 from commands.sell import sell, sell_confirm_listener
 from commands.buy import buy, buy_confirm_listener
+from commands.cancel import cancel, cancel_listener
 from commands.info import info
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -79,6 +80,9 @@ async def _unified_text_listener(update: Update, context: ContextTypes.DEFAULT_T
     if context.user_data.get("pending_buy"):
         await buy_confirm_listener(update, context)
         return
+    if context.user_data.get("pending_cancel"):
+        await cancel_listener(update, context)
+        return
 
 async def _on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.exception("Unhandled error", exc_info=context.error)
@@ -95,6 +99,7 @@ def build_telegram_app() -> Application:
     tga.add_handler(CommandHandler("sell", sell), group=1)
     tga.add_handler(CommandHandler("buy", buy), group=1)
     tga.add_handler(CommandHandler("info", info), group=1)
+    tga.add_handler(CommandHandler("cancel", cancel), group=1)
     tga.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _unified_text_listener), group=2)
     tga.add_error_handler(_on_error)
     return tga
