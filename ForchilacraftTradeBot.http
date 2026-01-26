@@ -1,0 +1,6 @@
+@ForchilacraftTradeBot_HostAddress = http://localhost:5194
+
+GET {{ForchilacraftTradeBot_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
